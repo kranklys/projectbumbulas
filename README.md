@@ -105,6 +105,27 @@ python main.py
 
 > Rezultatai bus matomi terminale per `logging` pranešimus.
 
+## Testavimas
+
+Jei norite patikrinti, kad pakeitimai veikia, naudokite `pytest`:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+GitHub Actions automatiškai paleidžia testus kiekvienam Pull Request ir `main` šakai.
+
+## Darbas per GitHub (kad galėčiau redaguoti ir papildyti)
+
+Kad galėtume patogiai peržiūrėti ir redaguoti pakeitimus GitHub'e, naudokite įprastą PR srautą:
+
+1. Sukurkite **fork**.
+2. Atskiroje šakoje padarykite pakeitimus.
+3. Atidarykite **Pull Request** į `main`.
+
+Detalesnės instrukcijos pateiktos faile [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ### Telegram pranešimų įjungimas (nebūtina)
 
 Norėdami gauti pranešimus į Telegram:
