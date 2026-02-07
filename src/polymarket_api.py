@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import time
 
 import requests
+from dotenv import load_dotenv
 
 from src.config import (
     BASE_API_URL,
@@ -27,11 +29,18 @@ class PolyClient:
     """Minimal client for fetching public data from Polymarket CLOB."""
 
     def __init__(self, base_url: str | None = None, timeout_s: int | None = None) -> None:
+        load_dotenv()
         self.base_url = base_url or BASE_API_URL
         self.public_base_url = PUBLIC_API_URL
         self.clob_base_url = CLOB_API_URL
         self.timeout_s = timeout_s or DEFAULT_TIMEOUT_S
         self.session = requests.Session()
+        self.api_key = os.getenv("POLYMARKET_API_KEY")
+        self.api_secret = os.getenv("POLYMARKET_API_SECRET")
+        self.api_passphrase = os.getenv("POLYMARKET_PASSPHRASE")
+        self.has_credentials = all(
+            [self.api_key, self.api_secret, self.api_passphrase]
+        )
 
     def _get(
         self,
@@ -39,6 +48,8 @@ class PolyClient:
         params: dict[str, Any] | None = None,
         allow_fallback: bool = True,
     ) -> dict | list | None:
+        if not self.has_credentials:
+            logger.info("Please fill in your credentials in the .env file.")
         try:
             response = self.session.get(url, params=params, timeout=self.timeout_s)
             if response.status_code == 401:
