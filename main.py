@@ -39,6 +39,7 @@ from src.backtest import (
 )
 from rich.console import Console, Group
 from rich.live import Live
+from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -276,6 +277,65 @@ def _is_reputable_trade(
     return trader_stats.get(trader_key, 0) >= 5
 
 
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def build_market_snapshots(
+    events: list[dict],
+    client: PolyClient,
+    limit: int = 10,
+) -> tuple[list[dict], dict[str, int]]:
+    tracked: list[dict] = []
+    health = {"events": 1 if events else 0, "prices": 0, "books": 0}
+    market_entries: list[dict] = []
+    for event in events:
+        markets = event.get("markets") or []
+        for market in markets:
+            title = (
+                market.get("question")
+                or market.get("title")
+                or event.get("title")
+                or "Unknown"
+            )
+            liquidity = _safe_float(
+                market.get("liquidity")
+                or market.get("volume")
+                or market.get("volume24h")
+                or market.get("volumeUsd")
+            )
+            token_ids = market.get("clobTokenIds") or []
+            for token_id in token_ids:
+                token_id = str(token_id)
+                price_payload = client.fetch_token_price(token_id)
+                price = price_payload.get("price")
+                if price is None:
+                    continue
+                health["prices"] += 1
+                market_entries.append(
+                    {
+                        "title": title,
+                        "token_id": token_id,
+                        "price": _safe_float(price),
+                        "liquidity": liquidity,
+                    }
+                )
+    market_entries.sort(key=lambda entry: entry.get("liquidity", 0.0), reverse=True)
+    for entry in market_entries[:limit]:
+        tracked.append(
+            {
+                "title": entry["title"],
+                "token_id": entry["token_id"],
+                "price": f"{entry['price']:.4f}",
+                "liquidity": entry["liquidity"],
+            }
+        )
+    return tracked, health
+
+
 def get_current_market_price(market_details: dict) -> float | None:
     for key in ("lastTradePrice", "price", "last_price"):
         if key in market_details:
@@ -506,37 +566,38 @@ class Dashboard:
         self.live.update(self._render(stats, state), refresh=True)
 
     def _render(self, stats: dict, state: dict) -> Group:
-        table = Table(title="📊 Polymarket Smart Money Dashboard", expand=True)
-        table.add_column("Metric", style="bold cyan")
-        table.add_column("Value", style="magenta")
-        table.add_row("Cycle", str(stats.get("cycle", "-")))
-        table.add_row("Total Events Scanned", str(stats.get("total_events_scanned", 0)))
-        table.add_row(
-            "Total Whale Walls Found",
-            str(stats.get("total_whale_walls_found", 0)),
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="body"),
+            Layout(name="footer", size=5),
         )
-        table.add_row("Whale Trades", str(stats.get("whale_trades", 0)))
-        table.add_row("Alerts Sent", str(stats.get("alerts_sent", 0)))
-        table.add_row("Elite Wallets", str(len(state.get("elite_smart_wallets", []))))
+        layout["body"].split_row(
+            Layout(name="left"),
+            Layout(name="right"),
+        )
+
+        header_text = Text("POLYMARKET WHALE TRACKER | USER: Bumbulas", style="bold")
+        layout["header"].update(Panel(header_text, border_style="cyan"))
+
+        markets_table = Table(title="Tracked Markets (Top 10)", expand=True)
+        markets_table.add_column("Market", style="bold cyan")
+        markets_table.add_column("Price", style="magenta")
+        for entry in stats.get("tracked_markets", []):
+            markets_table.add_row(entry.get("title", "Unknown"), entry.get("price", "-"))
+        layout["left"].update(Panel(markets_table, border_style="green"))
+
+        whale_entries = stats.get("whale_feed", []) or ["No whale alerts yet."]
+        whale_text = Text.from_markup("\n".join(whale_entries))
+        layout["right"].update(Panel(whale_text, title="Whale Alerts", border_style="red"))
+
+        health = stats.get("system_health", "No health data.")
         top_market = stats.get("top_opportunity_market") or "-"
-        top_amount = stats.get("top_opportunity_amount")
-        top_amount_text = f"${top_amount:,.2f}" if isinstance(top_amount, (int, float)) else "-"
-        table.add_row("TOP OPPORTUNITY", f"{top_market} | {top_amount_text}")
-        last_score = stats.get("last_score")
-        table.add_row("Last Score", str(last_score) if last_score is not None else "-")
-        table.add_row("Last Market", stats.get("last_market", "-"))
-        table.add_row("Last URL", stats.get("last_url", "-"))
-        table.add_row("Seen Trades (24h)", str(len(state.get("seen_trades", []))))
-        feed_entries = stats.get("trade_feed") or []
-        feed_text = Text.from_markup("\n".join(feed_entries)) if feed_entries else Text(
-            "No trades fetched yet."
-        )
-        feed_panel = Panel(
-            feed_text,
-            title="Live Feed (Latest Trades)",
-            border_style="cyan",
-        )
-        return Group(table, feed_panel)
+        top_amount = stats.get("top_opportunity_amount", 0.0)
+        top_text = f"Top Opportunity: {top_market} | ${top_amount:,.2f}"
+        footer_text = Text(f"{health}\n{top_text}")
+        layout["footer"].update(Panel(footer_text, title="System Health", border_style="blue"))
+        return Group(layout)
 
 
 def add_tracked_position(
@@ -1416,60 +1477,78 @@ def main() -> None:
     total_whale_walls_found = int(state.get("total_whale_walls_found", 0))
     quiet_cycles = 0
     adaptive_sleep_s = POLL_INTERVAL_S
+    recent_whale_alerts = list(state.get("recent_whale_alerts", []))
 
     dashboard.start()
     try:
         while True:
-            trades = None
-            for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
-                try:
-                    trades = client.fetch_latest_trades()
-                    if trades is None:
-                        raise ValueError("No trade data returned")
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Trade fetch attempt %s/%s failed: %s",
-                        attempt,
-                        FETCH_RETRY_ATTEMPTS,
-                        exc,
+            events = client.fetch_active_events(limit=10)
+            total_events_scanned += len(events)
+            tracked_markets, health = build_market_snapshots(events, client)
+            whale_feed: list[str] = []
+            bid_volumes: dict[str, float] = {}
+            books_ok = 0
+            for entry in tracked_markets[:5]:
+                token_id = entry["token_id"]
+                book = client.fetch_orderbook(token_id)
+                if book:
+                    books_ok += 1
+                bids = book.get("bids") or []
+                asks = book.get("asks") or []
+                for bid in bids:
+                    bid_size = _safe_float(bid.get("size"))
+                    bid_price = _safe_float(bid.get("price"))
+                    bid_volumes[entry["title"]] = bid_volumes.get(entry["title"], 0.0) + (
+                        bid_size * bid_price
                     )
-                    time.sleep(FETCH_RETRY_BACKOFF_S * attempt)
-            if not trades:
-                logger.warning("No trades returned from API.")
-                total_events_scanned += int(client.last_events_count)
-                stats = {
-                    "cycle": cycle,
-                    "new_trades": 0,
-                    "total_events_scanned": total_events_scanned,
-                    "total_whale_walls_found": total_whale_walls_found,
-                    "trade_feed": ["No trades returned from API."],
-                    "fetched_trades": 0,
-                }
-            else:
-                stats = process_trades(
-                    trades,
-                    notifier,
-                    client,
-                    state,
-                    trader_history,
-                    history_manager,
-                    discovered_watchlist,
-                    signal_history,
-                    virtual_trades,
-                )
-                stats["cycle"] = cycle
-                total_events_scanned += int(stats.get("events_scanned", 0))
-                total_whale_walls_found += int(stats.get("whale_trades", 0))
-                state["total_events_scanned"] = total_events_scanned
-                state["total_whale_walls_found"] = total_whale_walls_found
-                stats["total_events_scanned"] = total_events_scanned
-                stats["total_whale_walls_found"] = total_whale_walls_found
-                if cycle % 10 == 0:
-                    update_tracked_positions(client, notifier, state)
-                    log_top_traders(state)
+                for side_label, entries in (("BUY", bids), ("SELL", asks)):
+                    for order in entries:
+                        size_value = _safe_float(order.get("size"))
+                        if size_value <= 100:
+                            continue
+                        price_value = _safe_float(order.get("price"))
+                        alert_key = f"{token_id}:{side_label}:{price_value}:{size_value}"
+                        if alert_key in recent_whale_alerts:
+                            continue
+                        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        whale_feed.append(
+                            f"[{timestamp}] [WHALE {side_label}] {entry['title']} | "
+                            f"Size: {size_value:,.2f} | Price: {price_value:.4f}"
+                        )
+                        recent_whale_alerts.append(alert_key)
+                        if len(recent_whale_alerts) > 20:
+                            recent_whale_alerts = recent_whale_alerts[-20:]
+                    if whale_feed:
+                        break
+                time.sleep(2)
 
-            if stats.get("fetched_trades", 0) == 0:
+            health["books"] = books_ok
+            health_text = (
+                f"Events OK: {health.get('events', 0)} | "
+                f"Prices OK: {health.get('prices', 0)} | "
+                f"Books OK: {health.get('books', 0)}"
+            )
+            top_market = None
+            top_amount = 0.0
+            if bid_volumes:
+                top_market, top_amount = max(bid_volumes.items(), key=lambda item: item[1])
+            stats = {
+                "cycle": cycle,
+                "total_events_scanned": total_events_scanned,
+                "total_whale_walls_found": total_whale_walls_found + len(whale_feed),
+                "tracked_markets": tracked_markets,
+                "whale_feed": whale_feed,
+                "system_health": health_text,
+                "whale_trades": len(whale_feed),
+                "top_opportunity_market": top_market,
+                "top_opportunity_amount": top_amount,
+            }
+            total_whale_walls_found = stats["total_whale_walls_found"]
+            state["total_events_scanned"] = total_events_scanned
+            state["total_whale_walls_found"] = total_whale_walls_found
+            state["recent_whale_alerts"] = recent_whale_alerts
+
+            if not tracked_markets:
                 quiet_cycles += 1
             else:
                 quiet_cycles = 0
