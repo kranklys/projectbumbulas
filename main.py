@@ -143,6 +143,50 @@ def get_trade_id(trade: dict, fallback_index: int) -> str:
     )
 
 
+def normalize_trade(trade: dict, fallback_index: int) -> dict:
+    """Normalize trade fields to a consistent schema."""
+    normalized = dict(trade)
+    normalized.setdefault("id", get_trade_id(trade, fallback_index))
+    trader = (
+        trade.get("trader")
+        or trade.get("taker")
+        or trade.get("maker")
+        or trade.get("wallet")
+    )
+    if trader is not None:
+        normalized.setdefault("trader", trader)
+
+    condition_id = trade.get("conditionId") or trade.get("condition_id")
+    if condition_id is not None:
+        normalized.setdefault("condition_id", condition_id)
+
+    if "price" not in normalized:
+        price = trade.get("price") or trade.get("pricePerShare") or trade.get("avgPrice")
+        if price is not None:
+            normalized["price"] = price
+
+    if "size" not in normalized:
+        size = (
+            trade.get("size")
+            or trade.get("quantity")
+            or trade.get("shares")
+            or trade.get("amount")
+        )
+        if size is not None:
+            normalized["size"] = size
+
+    if "marketUrl" not in normalized:
+        url = trade.get("marketUrl") or trade.get("url")
+        if url is not None:
+            normalized["marketUrl"] = url
+
+    side = extract_trade_side(trade)
+    if side is not None:
+        normalized.setdefault("side", side)
+
+    return normalized
+
+
 def get_reputation_label(count: int) -> str:
     if count >= 10:
         return "Elite Trader"
@@ -465,7 +509,18 @@ def process_trades(
     trader_history: dict,
     history_manager: HistoryManager,
 ) -> None:
-    analyzer = TradeAnalyzer(trades)
+    normalized_trades = []
+    for index, trade in enumerate(trades):
+        if not isinstance(trade, dict):
+            logger.warning("Skipping non-dict trade payload at index %s: %s", index, trade)
+            continue
+        normalized_trades.append(normalize_trade(trade, index))
+
+    if not normalized_trades:
+        logger.warning("No valid trades to process after normalization.")
+        return
+
+    analyzer = TradeAnalyzer(normalized_trades)
     whale_trades = analyzer.find_whale_trades()
     seen_trade_ids = deque(state.get("seen_trade_ids", []), maxlen=2000)
     seen_trade_id_set = set(seen_trade_ids)
@@ -473,7 +528,7 @@ def process_trades(
     trader_profiles = state.get("trader_profiles", {})
 
     for index, trade in enumerate(whale_trades):
-        trade_id = get_trade_id(trade, index)
+        trade_id = str(trade.get("id") or get_trade_id(trade, index))
         if trade_id in seen_trade_id_set:
             continue
 
@@ -606,6 +661,15 @@ def process_trades(
                 str(condition_id) if condition_id else None,
                 entry_price,
                 str(trader),
+            )
+        else:
+            logger.info(
+                "Skipping whale trade %s | watchlisted=%s | high_impact=%s | trader=%s | value=%s",
+                trade_id,
+                is_watchlisted,
+                is_high_impact,
+                trade.get("trader") or "Unknown",
+                trade.get("estimated_usd_value"),
             )
 
         seen_trade_ids.append(trade_id)
