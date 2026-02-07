@@ -25,6 +25,8 @@ class BotStateStorage:
                 "tracked_positions": [],
                 "market_volumes": {},
                 "recent_smart_trades": [],
+                "recent_market_signals": [],
+                "recent_volume_spikes": [],
             }
 
         try:
@@ -38,6 +40,8 @@ class BotStateStorage:
                 "tracked_positions": [],
                 "market_volumes": {},
                 "recent_smart_trades": [],
+                "recent_market_signals": [],
+                "recent_volume_spikes": [],
             }
 
         data.setdefault("processed_trade_ids", [])
@@ -45,6 +49,8 @@ class BotStateStorage:
         data.setdefault("tracked_positions", [])
         data.setdefault("market_volumes", {})
         data.setdefault("recent_smart_trades", [])
+        data.setdefault("recent_market_signals", [])
+        data.setdefault("recent_volume_spikes", [])
         return data
 
     def cleanup(self, state: dict[str, Any], max_trades: int = 1000) -> None:
@@ -54,6 +60,12 @@ class BotStateStorage:
         recent = state.get("recent_smart_trades", [])
         if isinstance(recent, list) and len(recent) > max_trades:
             state["recent_smart_trades"] = recent[-max_trades:]
+        market_signals = state.get("recent_market_signals", [])
+        if isinstance(market_signals, list) and len(market_signals) > max_trades:
+            state["recent_market_signals"] = market_signals[-max_trades:]
+        volume_spikes = state.get("recent_volume_spikes", [])
+        if isinstance(volume_spikes, list) and len(volume_spikes) > max_trades:
+            state["recent_volume_spikes"] = volume_spikes[-max_trades:]
 
     def save(self, state: dict[str, Any]) -> None:
         try:

@@ -41,6 +41,8 @@ def format_trade_message(
     reasons: list[str] | None = None,
     risk_label: str | None = None,
     risk_reasons: list[str] | None = None,
+    signal_type: str | None = None,
+    signal_density: str | None = None,
 ) -> str:
     value = trade.get("estimated_usd_value")
     trader = (
@@ -60,6 +62,8 @@ def format_trade_message(
     reason_text = ", ".join(reasons or []) or "N/A"
     risk_text = risk_label or "Unknown"
     risk_reason_text = ", ".join(risk_reasons or []) or "N/A"
+    signal_type_label = signal_type or "Standard"
+    density_label = signal_density or "N/A"
 
     return (
         f"{header}\n\n"
@@ -72,6 +76,8 @@ def format_trade_message(
         f"🧩 Reasons: {reason_text}\n\n"
         f"⚠️ Risk: {risk_text}\n"
         f"🧾 Risk Factors: {risk_reason_text}\n\n"
+        f"🏷️ Signal Type: {signal_type_label}\n"
+        f"📊 Signal Density: {density_label}\n\n"
         f"👤 Trader: {trader}\n\n"
         f"🔗 Link: {link}"
     )
@@ -192,6 +198,20 @@ def update_recent_smart_trades(state: dict, trade: dict) -> None:
     state["recent_smart_trades"] = recent
 
 
+def update_recent_market_signals(state: dict, condition_id: str | None) -> None:
+    if not condition_id:
+        return
+    recent = state.get("recent_market_signals", [])
+    recent.append({"timestamp": time.time(), "condition_id": condition_id})
+    state["recent_market_signals"] = recent
+
+
+def update_recent_volume_spikes(state: dict, market_id: str) -> None:
+    recent = state.get("recent_volume_spikes", [])
+    recent.append({"timestamp": time.time(), "market_id": market_id})
+    state["recent_volume_spikes"] = recent
+
+
 def get_sentiment(state: dict) -> str:
     recent = state.get("recent_smart_trades", [])
     cutoff = time.time() - 3600
@@ -215,6 +235,33 @@ def get_sentiment(state: dict) -> str:
     return "Neutral"
 
 
+def get_signal_context(state: dict, condition_id: str | None) -> tuple[str, str]:
+    now = time.time()
+    market_signals = state.get("recent_market_signals", [])
+    volume_spikes = state.get("recent_volume_spikes", [])
+
+    signals_15m = sum(1 for s in market_signals if now - s.get("timestamp", 0) <= 900)
+    signals_60m = sum(1 for s in market_signals if now - s.get("timestamp", 0) <= 3600)
+    density_label = f"15m:{signals_15m} | 60m:{signals_60m}"
+
+    if condition_id:
+        recent_spike = any(
+            s.get("market_id") == condition_id and now - s.get("timestamp", 0) <= 1800
+            for s in volume_spikes
+        )
+        recent_market_signals = sum(
+            1
+            for s in market_signals
+            if s.get("condition_id") == condition_id and now - s.get("timestamp", 0) <= 900
+        )
+        if recent_spike and recent_market_signals >= 2:
+            return "Confirmed", density_label
+        if recent_market_signals >= 3:
+            return "Momentum", density_label
+
+    return "Standard", density_label
+
+
 def update_tracked_positions(
     client: PolyClient,
     notifier: TelegramNotifier,
@@ -227,6 +274,7 @@ def update_tracked_positions(
         state["market_volumes"] = updated_volumes
         for spike in spikes:
             notifier.send_message(format_volume_spike_message(spike))
+            update_recent_volume_spikes(state, spike.get("market_id", ""))
     else:
         logger.warning("No market summaries returned for volume spike detection.")
 
@@ -354,6 +402,11 @@ def process_trades(
                 trade,
             )
             update_recent_smart_trades(state, trade)
+            update_recent_market_signals(state, str(condition_id) if condition_id else None)
+            signal_type, signal_density = get_signal_context(
+                state,
+                str(condition_id) if condition_id else None,
+            )
             score, reasons = compute_signal_score(
                 trade,
                 market_details,
@@ -371,6 +424,8 @@ def process_trades(
                 reasons=reasons,
                 risk_label=risk_label,
                 risk_reasons=risk_reasons,
+                signal_type=signal_type,
+                signal_density=signal_density,
             )
             notifier.send_message(message)
             add_tracked_position(
