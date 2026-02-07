@@ -19,18 +19,32 @@ class BotStateStorage:
 
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"processed_trade_ids": [], "trader_stats": {}}
+            return {
+                "processed_trade_ids": [],
+                "trader_stats": {},
+                "tracked_positions": [],
+            }
 
         try:
             with self.path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             logger.exception("Failed to load state: %s", exc)
-            return {"processed_trade_ids": [], "trader_stats": {}}
+            return {
+                "processed_trade_ids": [],
+                "trader_stats": {},
+                "tracked_positions": [],
+            }
 
         data.setdefault("processed_trade_ids", [])
         data.setdefault("trader_stats", {})
+        data.setdefault("tracked_positions", [])
         return data
+
+    def cleanup(self, state: dict[str, Any], max_trades: int = 1000) -> None:
+        processed = state.get("processed_trade_ids", [])
+        if isinstance(processed, list) and len(processed) > max_trades:
+            state["processed_trade_ids"] = processed[-max_trades:]
 
     def save(self, state: dict[str, Any]) -> None:
         try:
