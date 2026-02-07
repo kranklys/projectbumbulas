@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from src.config import (
     POLL_INTERVAL_S,
     SAVE_INTERVAL_CYCLES,
 )
+from src.backtest import BacktestConfig, run_backtest
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
@@ -1243,6 +1245,34 @@ def log_top_traders(state: dict, limit: int = 5) -> None:
     logger.info("Top traders: %s", " | ".join(summary))
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Polymarket Smart Money tracker")
+    parser.add_argument(
+        "--backtest",
+        dest="backtest_path",
+        help="Path to historical trades JSON for backtesting.",
+    )
+    parser.add_argument(
+        "--score-threshold",
+        type=int,
+        default=70,
+        help="Minimum signal score to include in the backtest.",
+    )
+    parser.add_argument(
+        "--horizon-minutes",
+        type=int,
+        default=60,
+        help="Minutes after entry to evaluate exit price in backtest.",
+    )
+    parser.add_argument(
+        "--max-trades",
+        type=int,
+        default=None,
+        help="Optional limit on number of trades loaded for backtest.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     client = PolyClient()
     notifier = TelegramNotifier()
@@ -1320,4 +1350,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    if args.backtest_path:
+        config = BacktestConfig(
+            score_threshold=args.score_threshold,
+            horizon_minutes=args.horizon_minutes,
+            max_trades=args.max_trades,
+        )
+        run_backtest(args.backtest_path, config)
+    else:
+        main()
