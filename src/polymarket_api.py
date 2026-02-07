@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -201,10 +202,19 @@ class PolyClient:
             title = event.get("title") or "Unknown"
             for market in event.get("markets") or []:
                 token_ids = market.get("clobTokenIds") or []
+                if isinstance(token_ids, str):
+                    try:
+                        token_ids = json.loads(token_ids)
+                    except json.JSONDecodeError:
+                        token_ids = []
                 if not token_ids:
                     continue
                 token_id = str(token_ids[0])
-                price_payload = self.fetch_token_price(token_id)
+                try:
+                    price_payload = self.fetch_token_price(token_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Price fetch failed for token %s: %s", token_id, exc)
+                    continue
                 price = price_payload.get("price")
                 if price is None:
                     continue
