@@ -14,6 +14,7 @@ WATCHLIST_ADDRESSES = {
     "0x2222222222222222222222222222222222222222",
     "0x3333333333333333333333333333333333333333",
 }
+WHALE_TRADE_THRESHOLD = 50
 
 
 class TradeAnalyzer:
@@ -56,7 +57,9 @@ class TradeAnalyzer:
         return new_trades, new_trade_ids
 
     def find_whale_trades(
-        self, trades: list[dict[str, Any]] | None = None, min_usd: float = 100
+        self,
+        trades: list[dict[str, Any]] | None = None,
+        min_usd: float = WHALE_TRADE_THRESHOLD,
     ) -> list[dict[str, Any]]:
         """Return trades with total value above min_usd."""
         trades_to_check = trades if trades is not None else self.trades

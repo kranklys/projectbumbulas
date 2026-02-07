@@ -194,8 +194,25 @@ def _format_trade_feed_entry(
     trade: dict,
     amount: float,
     side: str | None,
+    reasoning: list[str] | None,
 ) -> str:
-    market_name = (
+    market_name = _extract_market_name(trade)
+    price = trade.get("price") or "N/A"
+    side_label = side or "N/A"
+    if side_label.upper() == "BUY":
+        side_label = "[green]BUY[/green]"
+    elif side_label.upper() == "SELL":
+        side_label = "[red]SELL[/red]"
+    reasoning_text = "; ".join(reasoning or [])
+    insight = f" | Insight: {reasoning_text}" if reasoning_text else ""
+    return (
+        f"[TRADE] Market: {market_name} | Side: {side_label} | "
+        f"Amount: ${amount:,.2f} | Price: {price}{insight}"
+    )
+
+
+def _extract_market_name(trade: dict) -> str:
+    return (
         trade.get("marketTitle")
         or trade.get("market_title")
         or trade.get("title")
@@ -203,16 +220,62 @@ def _format_trade_feed_entry(
         or trade.get("market")
         or "Unknown"
     )
-    price = trade.get("price") or "N/A"
-    side_label = side or "N/A"
-    if side_label.upper() == "BUY":
-        side_label = "[green]BUY[/green]"
-    elif side_label.upper() == "SELL":
-        side_label = "[red]SELL[/red]"
-    return (
-        f"[TRADE] Market: {market_name} | Side: {side_label} | "
-        f"Amount: ${amount:,.2f} | Price: {price}"
+
+
+def _build_reasoning(
+    trade: dict,
+    amount: float,
+    side: str | None,
+    market_trade_counts: dict[str, int],
+) -> list[str]:
+    reasons = []
+    market_name = _extract_market_name(trade)
+    if market_trade_counts.get(market_name, 0) > 1:
+        reasons.append(f"Accumulation detected in {market_name}")
+    if side and side.upper() == "BUY" and amount >= 1000:
+        reasons.append("Strong Bullish Signal")
+    impact = estimate_price_impact(trade)
+    if impact is not None and impact >= 0.02:
+        reasons.append("Momentum Alert")
+    if not reasons:
+        reasons.append("Notable activity")
+    return reasons
+
+
+def _select_top_opportunity(
+    flows: list[dict],
+    max_entries: int = 100,
+) -> tuple[str | None, float]:
+    if not flows:
+        return None, 0.0
+    recent_entries = flows[-max_entries:]
+    totals: dict[str, float] = {}
+    for entry in recent_entries:
+        market = entry.get("market") or "Unknown"
+        totals[market] = totals.get(market, 0.0) + float(entry.get("amount", 0.0))
+    top_market = max(totals.items(), key=lambda item: item[1])
+    return top_market[0], top_market[1]
+
+
+def _is_reputable_trade(
+    trade: dict,
+    analyzer: TradeAnalyzer,
+    trader_stats: dict,
+    trader_profiles: dict,
+) -> bool:
+    trader = (
+        trade.get("trader")
+        or trade.get("taker")
+        or trade.get("maker")
+        or trade.get("wallet")
     )
+    trader_key = str(trader).lower() if trader else ""
+    if analyzer.is_watchlist_trade(trade):
+        return True
+    profile = trader_profiles.get(trader_key, {})
+    if profile.get("elite"):
+        return True
+    return trader_stats.get(trader_key, 0) >= 5
 
 
 def get_current_market_price(market_details: dict) -> float | None:
@@ -353,6 +416,11 @@ def cleanup_state_memory(state: dict, history_manager: HistoryManager) -> None:
         for entry in state.get("seen_trades", [])
         if entry.get("timestamp", 0) >= cutoff
     ]
+    state["recent_reputable_flows"] = [
+        entry
+        for entry in state.get("recent_reputable_flows", [])
+        if entry.get("timestamp", 0) >= cutoff
+    ]
     high_score_history = state.get("high_score_history", {})
     for trader_key, entries in list(high_score_history.items()):
         filtered = [ts for ts in entries if ts >= now - DISCOVERY_WINDOW_S]
@@ -453,6 +521,10 @@ class Dashboard:
         table.add_row("Whale Trades", str(stats.get("whale_trades", 0)))
         table.add_row("Alerts Sent", str(stats.get("alerts_sent", 0)))
         table.add_row("Elite Wallets", str(len(state.get("elite_smart_wallets", []))))
+        top_market = stats.get("top_opportunity_market") or "-"
+        top_amount = stats.get("top_opportunity_amount")
+        top_amount_text = f"${top_amount:,.2f}" if isinstance(top_amount, (int, float)) else "-"
+        table.add_row("TOP OPPORTUNITY", f"{top_market} | {top_amount_text}")
         last_score = stats.get("last_score")
         table.add_row("Last Score", str(last_score) if last_score is not None else "-")
         table.add_row("Last Market", stats.get("last_market", "-"))
@@ -1207,6 +1279,8 @@ def process_trades(
         "last_market": None,
         "last_url": None,
         "trade_feed": [],
+        "top_opportunity_market": None,
+        "top_opportunity_amount": None,
     }
     normalized_trades = []
     for index, trade in enumerate(trades):
@@ -1230,21 +1304,64 @@ def process_trades(
     for trade_id in new_trade_ids:
         seen_trades.append({"trade_id": trade_id, "timestamp": now})
 
+    trader_stats = state.get("trader_stats", {})
+    trader_profiles = state.get("trader_profiles", {})
+
+    market_trade_counts = Counter(_extract_market_name(trade) for trade in new_trades)
     feed_entries = []
-    min_trade_usd = 100.0
-    for trade in new_trades[:10]:
+    min_trade_usd = 50.0
+    recent_flows = list(state.get("recent_reputable_flows", []))
+    for trade in new_trades:
         amount = analyzer.estimate_trade_value_usd(trade)
         side = extract_trade_side(trade)
-        if amount < min_trade_usd:
-            feed_entries.append(f"[SKIP] Small trade of ${amount:,.2f}")
-            continue
-        feed_entries.append(_format_trade_feed_entry(trade, amount, side))
+        market_name = _extract_market_name(trade)
+        if amount >= min_trade_usd:
+            reasoning = _build_reasoning(trade, amount, side, market_trade_counts)
+            logger.info(
+                "[ANALYSIS] %s | Market: %s | Amount: $%.2f",
+                "; ".join(reasoning),
+                market_name,
+                amount,
+            )
+            if _is_reputable_trade(trade, analyzer, trader_stats, trader_profiles):
+                recent_flows.append(
+                    {
+                        "timestamp": now,
+                        "market": market_name,
+                        "amount": amount,
+                    }
+                )
+        else:
+            reasoning = None
+        if len(feed_entries) < 10:
+            if amount < min_trade_usd:
+                feed_entries.append(f"[SKIP] Small trade of ${amount:,.2f}")
+            else:
+                feed_entries.append(
+                    _format_trade_feed_entry(trade, amount, side, reasoning)
+                )
     stats["trade_feed"] = feed_entries
+    state["recent_reputable_flows"] = recent_flows[-200:]
+    top_market, top_amount = _select_top_opportunity(state["recent_reputable_flows"])
+    stats["top_opportunity_market"] = top_market
+    stats["top_opportunity_amount"] = top_amount
+    five_min_cutoff = now - 5 * 60
+    recent_window = [
+        entry
+        for entry in state["recent_reputable_flows"]
+        if entry.get("timestamp", 0) >= five_min_cutoff
+    ]
+    if recent_window:
+        window_top, window_amount = _select_top_opportunity(recent_window)
+        if window_top:
+            logger.info(
+                "I recommend watching %s because $%.2f amount of money flowed in during the last 5 minutes.",
+                window_top,
+                window_amount,
+            )
 
     whale_trades = analyzer.find_whale_trades(new_trades)
     stats["whale_trades"] = len(whale_trades)
-    trader_stats = state.get("trader_stats", {})
-    trader_profiles = state.get("trader_profiles", {})
 
     for index, trade in enumerate(whale_trades):
         trade_id = str(trade.get("id") or get_trade_id(trade, index))
