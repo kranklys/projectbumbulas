@@ -192,22 +192,34 @@ class PolyClient:
         return {}
 
     def fetch_markets(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Fetch market summaries for volume/liquidity analysis."""
-        url = f"{self.base_url}{MARKETS_ENDPOINT}"
-        params = {"limit": limit}
-
-        logger.info("Fetching market summaries from %s", url)
-        payload = self._get(url, params=params)
-        if payload is None:
+        """Fetch market data using Gamma events + CLOB price."""
+        events = self.fetch_active_events(limit=limit)
+        if not events:
             return []
+        markets: list[dict[str, Any]] = []
+        for event in events:
+            title = event.get("title") or "Unknown"
+            for market in event.get("markets") or []:
+                token_ids = market.get("clobTokenIds") or []
+                if not token_ids:
+                    continue
+                token_id = str(token_ids[0])
+                price_payload = self.fetch_token_price(token_id)
+                price = price_payload.get("price")
+                if price is None:
+                    continue
+                markets.append(
+                    {
+                        "title": title,
+                        "price": price,
+                        "id": token_id,
+                    }
+                )
+        return markets
 
-        if isinstance(payload, dict) and "markets" in payload:
-            return payload["markets"]
-        if isinstance(payload, list):
-            return payload
-
-        logger.warning("Unexpected markets response format: %s", type(payload))
-        return []
+    def get_market_data(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return analyzer-ready market data from Gamma + CLOB."""
+        return self.fetch_markets(limit=limit)
 
     def fetch_historical_data(
         self,

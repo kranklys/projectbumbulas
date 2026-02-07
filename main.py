@@ -1243,6 +1243,7 @@ def update_tracked_positions(
             notifier.send_message(format_volume_spike_message(spike))
             update_recent_volume_spikes(state, spike.get("market_id", ""))
     else:
+        print("DEBUG: API returned 0 markets")
         logger.warning("No market summaries returned for volume spike detection.")
 
     tracked_positions = state.get("tracked_positions", [])
