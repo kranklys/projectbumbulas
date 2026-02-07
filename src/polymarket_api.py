@@ -1,4 +1,4 @@
-"""Polymarket CLOB API client."""
+"""Polymarket data client (Gamma + CLOB)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ from src.config import (
     MARKETS_ENDPOINT,
     PUBLIC_API_URL,
     RATE_LIMIT_BACKOFF_S,
-    TRADES_ENDPOINT,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,25 +103,91 @@ class PolyClient:
             logger.exception("Failed to parse JSON response: %s", exc)
             return None
 
-    def fetch_latest_trades(self, limit: int = DEFAULT_TRADE_LIMIT) -> list[dict[str, Any]]:
-        """Fetch latest trades from the CLOB API."""
-        url = f"{self.clob_base_url}{TRADES_ENDPOINT}?t={int(time.time())}"
-        params = {"limit": limit}
-
-        logger.info("Fetching latest trades from %s", url)
-
-        payload = self._get(url, params=params)
+    def fetch_active_events(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Fetch active events from the Gamma API."""
+        url = f"{self.public_base_url}/events"
+        params = {"active": "true", "closed": "false", "limit": limit}
+        payload = self._get(url, params=params, allow_fallback=False)
         if payload is None:
-            logger.warning("Primary trades endpoint failed. Falling back to public markets.")
-            return self.fetch_public_markets(limit=10)
-
-        if isinstance(payload, dict) and "trades" in payload:
-            return payload["trades"]
+            return []
         if isinstance(payload, list):
             return payload
+        logger.warning("Unexpected events response format: %s", type(payload))
+        return []
 
-        logger.warning("Unexpected trades response format: %s", type(payload))
-        return self.fetch_public_markets(limit=10)
+    def fetch_token_price(self, token_id: str) -> dict[str, Any]:
+        """Fetch latest token price from the CLOB API."""
+        url = f"{self.clob_base_url}/price"
+        params = {"token_id": token_id, "side": "buy", "t": int(time.time())}
+        payload = self._get(url, params=params, allow_fallback=False)
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def fetch_orderbook(self, token_id: str) -> dict[str, Any]:
+        """Fetch orderbook depth from the CLOB API."""
+        url = f"{self.clob_base_url}/book"
+        params = {"token_id": token_id, "t": int(time.time())}
+        payload = self._get(url, params=params, allow_fallback=False)
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def fetch_latest_trades(self, limit: int = DEFAULT_TRADE_LIMIT) -> list[dict[str, Any]]:
+        """Build synthetic trade activity from events, prices, and orderbooks."""
+        logger.info("Fetching latest activity from Gamma events + CLOB price/book.")
+        events = self.fetch_active_events(limit=10)
+        if not events:
+            logger.warning("No active events returned from Gamma API.")
+            return []
+
+        activity: list[dict[str, Any]] = []
+        for event in events:
+            title = event.get("title") or event.get("question") or "Unknown"
+            markets = event.get("markets") or []
+            for market in markets:
+                token_ids = market.get("clobTokenIds") or []
+                for token_id in token_ids:
+                    price_payload = self.fetch_token_price(str(token_id))
+                    price = price_payload.get("price")
+                    book = self.fetch_orderbook(str(token_id))
+                    bids = book.get("bids") or []
+                    asks = book.get("asks") or []
+                    if not bids and not asks:
+                        continue
+                    max_bid = max(
+                        bids,
+                        key=lambda entry: float(entry.get("size", 0)),
+                        default=None,
+                    )
+                    max_ask = max(
+                        asks,
+                        key=lambda entry: float(entry.get("size", 0)),
+                        default=None,
+                    )
+                    for side_label, entry in (("BUY", max_bid), ("SELL", max_ask)):
+                        if not entry:
+                            continue
+                        try:
+                            size = float(entry.get("size", 0))
+                        except (TypeError, ValueError):
+                            size = 0.0
+                        if size <= 0:
+                            continue
+                        entry_price = entry.get("price") or price
+                        activity.append(
+                            {
+                                "marketTitle": title,
+                                "price": entry_price,
+                                "side": side_label,
+                                "amount": size,
+                                "token_id": str(token_id),
+                                "event_id": event.get("id"),
+                            }
+                        )
+                    if len(activity) >= limit:
+                        return activity[:limit]
+        return activity[:limit]
 
     def fetch_public_markets(self, limit: int = 10) -> list[dict[str, Any]]:
         """Fallback: fetch public markets when trades are unavailable."""
@@ -178,35 +243,16 @@ class PolyClient:
         limit: int = 500,
         max_pages: int = 10,
     ) -> list[dict[str, Any]]:
-        """Fetch historical trades for a given market/condition ID."""
-        url = f"{self.base_url}{TRADES_ENDPOINT}"
-        params: dict[str, Any] = {"limit": limit}
-        params["marketId"] = market_id
-        params["conditionId"] = market_id
-
-        trades: list[dict[str, Any]] = []
-        cursor: str | None = None
-        for _ in range(max_pages):
-            if cursor:
-                params["cursor"] = cursor
-            payload = self._get(url, params=params)
-            if payload is None:
-                break
-            if isinstance(payload, dict):
-                batch = payload.get("trades", [])
-                cursor = payload.get("next_cursor") or payload.get("nextCursor")
-            elif isinstance(payload, list):
-                batch = payload
-                cursor = None
-            else:
-                logger.warning("Unexpected historical trades response format: %s", type(payload))
-                break
-
-            if not isinstance(batch, list) or not batch:
-                break
-            trades.extend([trade for trade in batch if isinstance(trade, dict)])
-            if not cursor:
-                break
-
-        logger.info("Fetched %s historical trades for market %s", len(trades), market_id)
-        return trades
+        """Fetch market details for a given market/condition ID."""
+        _ = max_pages
+        url = f"{self.base_url}{MARKETS_ENDPOINT}"
+        params: dict[str, Any] = {"limit": limit, "id": market_id}
+        payload = self._get(url, params=params)
+        if payload is None:
+            return []
+        if isinstance(payload, dict) and "markets" in payload:
+            return payload["markets"]
+        if isinstance(payload, list):
+            return payload
+        logger.warning("Unexpected market history response format: %s", type(payload))
+        return []
