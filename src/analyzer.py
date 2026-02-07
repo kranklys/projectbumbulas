@@ -81,6 +81,66 @@ class TradeAnalyzer:
         return 0.0
 
 
+def compute_signal_score(
+    trade: dict[str, Any],
+    market_details: dict[str, Any] | None,
+    reputation_count: int,
+    impact: float | None,
+) -> tuple[int, list[str]]:
+    """Compute a 0-100 signal score with reasons."""
+    reasons: list[str] = []
+    score = 0
+
+    value = trade.get("estimated_usd_value")
+    if value is not None:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = None
+
+    if value is not None:
+        if value >= 50000:
+            score += 25
+            reasons.append("Very large trade size")
+        elif value >= 10000:
+            score += 15
+            reasons.append("Large trade size")
+        elif value >= 5000:
+            score += 10
+            reasons.append("Notable trade size")
+
+    if impact is not None:
+        if impact >= 0.05:
+            score += 20
+            reasons.append("High price impact")
+        elif impact >= 0.02:
+            score += 10
+            reasons.append("Moderate price impact")
+
+    if reputation_count >= 10:
+        score += 20
+        reasons.append("Elite trader frequency")
+    elif reputation_count >= 5:
+        score += 10
+        reasons.append("Frequent trader activity")
+
+    if market_details:
+        volume = _extract_volume_24h(market_details)
+        if volume is not None:
+            if volume >= 100000:
+                score += 15
+                reasons.append("High market liquidity")
+            elif volume >= 20000:
+                score += 10
+                reasons.append("Moderate market liquidity")
+            elif volume < 5000:
+                score -= 5
+                reasons.append("Low market liquidity")
+
+    score = max(0, min(100, score))
+    return score, reasons
+
+
 def track_market_volumes(
     markets: list[dict[str, Any]],
     previous_volumes: dict[str, float],

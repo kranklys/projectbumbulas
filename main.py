@@ -6,7 +6,7 @@ import logging
 import time
 from collections import deque
 
-from src.analyzer import TradeAnalyzer, track_market_volumes
+from src.analyzer import TradeAnalyzer, compute_signal_score, track_market_volumes
 from src.notifications import TelegramNotifier
 from src.polymarket_api import PolyClient
 from src.storage import BotStateStorage
@@ -27,6 +27,8 @@ def format_trade_message(
     reputation: str | None = None,
     critical: bool = False,
     sentiment: str | None = None,
+    signal_score: int | None = None,
+    reasons: list[str] | None = None,
 ) -> str:
     value = trade.get("estimated_usd_value")
     trader = (
@@ -42,6 +44,8 @@ def format_trade_message(
     reputation_label = reputation or "New"
     header = "🔴 CRITICAL ALERT" if critical else "🚨 Smart Trade Detected!"
     sentiment_label = sentiment or "Neutral"
+    score_label = f"{signal_score}/100" if signal_score is not None else "N/A"
+    reason_text = ", ".join(reasons or []) or "N/A"
 
     return (
         f"{header}\n\n"
@@ -50,6 +54,8 @@ def format_trade_message(
         f"📈 Price: {price}\n\n"
         f"🧠 Reputation: {reputation_label}\n\n"
         f"🌡️ Sentiment: {sentiment_label}\n\n"
+        f"✅ Signal Score: {score_label}\n"
+        f"🧩 Reasons: {reason_text}\n\n"
         f"👤 Trader: {trader}\n\n"
         f"🔗 Link: {link}"
     )
@@ -296,6 +302,7 @@ def process_trades(
             critical = trader_stats[trader_key] > 5
             condition_id = trade.get("conditionId") or trade.get("condition_id")
             market_title = None
+            market_details = None
             if condition_id:
                 market_details = client.get_market_details(str(condition_id))
                 if market_details:
@@ -317,6 +324,12 @@ def process_trades(
                 trade,
             )
             update_recent_smart_trades(state, trade)
+            score, reasons = compute_signal_score(
+                trade,
+                market_details,
+                trader_stats[trader_key],
+                impact,
+            )
             message = format_trade_message(
                 trade,
                 market_title=market_title,
@@ -324,6 +337,8 @@ def process_trades(
                 reputation=reputation,
                 critical=critical,
                 sentiment=get_sentiment(state),
+                signal_score=score,
+                reasons=reasons,
             )
             notifier.send_message(message)
             add_tracked_position(
