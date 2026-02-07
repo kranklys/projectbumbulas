@@ -1301,8 +1301,12 @@ def process_trades(
     )
     new_trades, new_trade_ids = analyzer.filter_new_trades(seen_trade_id_set)
     stats["new_trades"] = len(new_trades)
+    same_batch_message = None
     if not new_trades:
         logger.warning("No new trades to process after deduplication.")
+        if fetched_trades:
+            same_batch_message = "API returned the same batch, no new trades."
+            logger.info(same_batch_message)
     for trade_id in new_trade_ids:
         seen_trades.append({"trade_id": trade_id, "timestamp": now})
 
@@ -1311,6 +1315,8 @@ def process_trades(
 
     market_trade_counts = Counter(_extract_market_name(trade) for trade in fetched_trades)
     feed_entries = []
+    if same_batch_message:
+        feed_entries.append(same_batch_message)
     min_trade_usd = 50.0
     recent_flows = list(state.get("recent_reputable_flows", []))
     for trade in fetched_trades:
@@ -1659,6 +1665,8 @@ def main() -> None:
     last_performance_report = 0.0
     total_trades_scanned = int(state.get("total_trades_scanned", 0))
     total_trades_fetched = int(state.get("total_trades_fetched", 0))
+    quiet_cycles = 0
+    adaptive_sleep_s = POLL_INTERVAL_S
 
     dashboard.start()
     try:
@@ -1686,6 +1694,7 @@ def main() -> None:
                     "total_trades_scanned": total_trades_scanned,
                     "total_trades_fetched": total_trades_fetched,
                     "trade_feed": ["No trades returned from API."],
+                    "fetched_trades": 0,
                 }
             else:
                 stats = process_trades(
@@ -1709,6 +1718,17 @@ def main() -> None:
                 if cycle % 10 == 0:
                     update_tracked_positions(client, notifier, state)
                     log_top_traders(state)
+
+            if stats.get("fetched_trades", 0) == 0:
+                quiet_cycles += 1
+            else:
+                quiet_cycles = 0
+                adaptive_sleep_s = POLL_INTERVAL_S
+            if quiet_cycles >= 3:
+                logger.info(
+                    "Market seems quiet, or I'm being throttled. Adjusting wait time..."
+                )
+                adaptive_sleep_s = min(adaptive_sleep_s + 5, POLL_INTERVAL_S * 3)
 
             storage.cleanup(state)
             if cycle % SAVE_INTERVAL_CYCLES == 0:
@@ -1745,8 +1765,12 @@ def main() -> None:
                 last_performance_report = now
 
             cleanup_state_memory(state, history_manager)
+            logger.info(
+                "[LIVE] Checking for new trades... (Total seen so far: %s)",
+                len(state.get("seen_trades", [])),
+            )
             dashboard.update(stats, state)
-            time.sleep(POLL_INTERVAL_S)
+            time.sleep(adaptive_sleep_s)
             cycle += 1
     finally:
         dashboard.stop()

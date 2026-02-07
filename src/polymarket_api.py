@@ -106,8 +106,8 @@ class PolyClient:
 
     def fetch_latest_trades(self, limit: int = DEFAULT_TRADE_LIMIT) -> list[dict[str, Any]]:
         """Fetch latest trades from the CLOB API."""
-        url = f"{self.base_url}{TRADES_ENDPOINT}"
-        params = {"limit": limit, "ts": int(time.time() * 1000)}
+        url = f"{self.clob_base_url}{TRADES_ENDPOINT}?t={int(time.time())}"
+        params = {"limit": limit}
 
         logger.info("Fetching latest trades from %s", url)
 
