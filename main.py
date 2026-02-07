@@ -518,6 +518,8 @@ class Dashboard:
             "Trade Activity",
             f"Total Trades Scanned: {total_trades} | New Trades this Cycle: {new_trades}",
         )
+        total_fetched = stats.get("total_trades_fetched", 0)
+        table.add_row("Total Trades Fetched", str(total_fetched))
         table.add_row("Whale Trades", str(stats.get("whale_trades", 0)))
         table.add_row("Alerts Sent", str(stats.get("alerts_sent", 0)))
         table.add_row("Elite Wallets", str(len(state.get("elite_smart_wallets", []))))
@@ -1281,37 +1283,37 @@ def process_trades(
         "trade_feed": [],
         "top_opportunity_market": None,
         "top_opportunity_amount": None,
+        "fetched_trades": 0,
     }
-    normalized_trades = []
+    fetched_trades = []
     for index, trade in enumerate(trades):
         if not isinstance(trade, dict):
             logger.warning("Skipping non-dict trade payload at index %s: %s", index, trade)
             continue
-        normalized_trades.append(normalize_trade(trade, index))
+        fetched_trades.append(normalize_trade(trade, index))
+    stats["fetched_trades"] = len(fetched_trades)
 
     now = time.time()
     seen_trades = deque(normalize_seen_trades(state, now), maxlen=2000)
     seen_trade_id_set = {entry.get("trade_id") for entry in seen_trades}
     analyzer = TradeAnalyzer(
-        normalized_trades, watchlist=set(WATCHLIST_ADDRESSES) | discovered_watchlist
+        fetched_trades, watchlist=set(WATCHLIST_ADDRESSES) | discovered_watchlist
     )
     new_trades, new_trade_ids = analyzer.filter_new_trades(seen_trade_id_set)
     stats["new_trades"] = len(new_trades)
     if not new_trades:
         logger.warning("No new trades to process after deduplication.")
-        stats["trade_feed"] = ["No new trades this cycle."]
-        return stats
     for trade_id in new_trade_ids:
         seen_trades.append({"trade_id": trade_id, "timestamp": now})
 
     trader_stats = state.get("trader_stats", {})
     trader_profiles = state.get("trader_profiles", {})
 
-    market_trade_counts = Counter(_extract_market_name(trade) for trade in new_trades)
+    market_trade_counts = Counter(_extract_market_name(trade) for trade in fetched_trades)
     feed_entries = []
     min_trade_usd = 50.0
     recent_flows = list(state.get("recent_reputable_flows", []))
-    for trade in new_trades:
+    for trade in fetched_trades:
         amount = analyzer.estimate_trade_value_usd(trade)
         side = extract_trade_side(trade)
         market_name = _extract_market_name(trade)
@@ -1656,6 +1658,7 @@ def main() -> None:
     last_virtual_check = 0.0
     last_performance_report = 0.0
     total_trades_scanned = int(state.get("total_trades_scanned", 0))
+    total_trades_fetched = int(state.get("total_trades_fetched", 0))
 
     dashboard.start()
     try:
@@ -1681,6 +1684,7 @@ def main() -> None:
                     "cycle": cycle,
                     "new_trades": 0,
                     "total_trades_scanned": total_trades_scanned,
+                    "total_trades_fetched": total_trades_fetched,
                     "trade_feed": ["No trades returned from API."],
                 }
             else:
@@ -1697,8 +1701,11 @@ def main() -> None:
                 )
                 stats["cycle"] = cycle
                 total_trades_scanned += int(stats.get("new_trades", 0))
+                total_trades_fetched += int(stats.get("fetched_trades", 0))
                 state["total_trades_scanned"] = total_trades_scanned
+                state["total_trades_fetched"] = total_trades_fetched
                 stats["total_trades_scanned"] = total_trades_scanned
+                stats["total_trades_fetched"] = total_trades_fetched
                 if cycle % 10 == 0:
                     update_tracked_positions(client, notifier, state)
                     log_top_traders(state)
