@@ -510,14 +510,11 @@ class Dashboard:
         table.add_column("Metric", style="bold cyan")
         table.add_column("Value", style="magenta")
         table.add_row("Cycle", str(stats.get("cycle", "-")))
-        total_trades = stats.get("total_trades_scanned", 0)
-        new_trades = stats.get("new_trades", 0)
+        table.add_row("Total Events Scanned", str(stats.get("total_events_scanned", 0)))
         table.add_row(
-            "Trade Activity",
-            f"Total Trades Scanned: {total_trades} | New Trades this Cycle: {new_trades}",
+            "Total Whale Walls Found",
+            str(stats.get("total_whale_walls_found", 0)),
         )
-        total_fetched = stats.get("total_trades_fetched", 0)
-        table.add_row("Total Trades Fetched", str(total_fetched))
         table.add_row("Whale Trades", str(stats.get("whale_trades", 0)))
         table.add_row("Alerts Sent", str(stats.get("alerts_sent", 0)))
         table.add_row("Elite Wallets", str(len(state.get("elite_smart_wallets", []))))
@@ -1330,6 +1327,7 @@ def process_trades(
 
     stats["trade_feed"] = whale_alerts or ["No whale orders this cycle."]
     stats["whale_trades"] = len(whale_alerts)
+    stats["events_scanned"] = client.last_events_count
     state["processed_order_ids"] = list(processed_order_ids)[-5000:]
     if bid_volumes:
         top_market, top_amount = max(bid_volumes.items(), key=lambda item: item[1])
@@ -1414,8 +1412,8 @@ def main() -> None:
     cycle = 0
     last_virtual_check = 0.0
     last_performance_report = 0.0
-    total_trades_scanned = int(state.get("total_trades_scanned", 0))
-    total_trades_fetched = int(state.get("total_trades_fetched", 0))
+    total_events_scanned = int(state.get("total_events_scanned", 0))
+    total_whale_walls_found = int(state.get("total_whale_walls_found", 0))
     quiet_cycles = 0
     adaptive_sleep_s = POLL_INTERVAL_S
 
@@ -1439,11 +1437,12 @@ def main() -> None:
                     time.sleep(FETCH_RETRY_BACKOFF_S * attempt)
             if not trades:
                 logger.warning("No trades returned from API.")
+                total_events_scanned += int(client.last_events_count)
                 stats = {
                     "cycle": cycle,
                     "new_trades": 0,
-                    "total_trades_scanned": total_trades_scanned,
-                    "total_trades_fetched": total_trades_fetched,
+                    "total_events_scanned": total_events_scanned,
+                    "total_whale_walls_found": total_whale_walls_found,
                     "trade_feed": ["No trades returned from API."],
                     "fetched_trades": 0,
                 }
@@ -1460,12 +1459,12 @@ def main() -> None:
                     virtual_trades,
                 )
                 stats["cycle"] = cycle
-                total_trades_scanned += int(stats.get("new_trades", 0))
-                total_trades_fetched += int(stats.get("fetched_trades", 0))
-                state["total_trades_scanned"] = total_trades_scanned
-                state["total_trades_fetched"] = total_trades_fetched
-                stats["total_trades_scanned"] = total_trades_scanned
-                stats["total_trades_fetched"] = total_trades_fetched
+                total_events_scanned += int(stats.get("events_scanned", 0))
+                total_whale_walls_found += int(stats.get("whale_trades", 0))
+                state["total_events_scanned"] = total_events_scanned
+                state["total_whale_walls_found"] = total_whale_walls_found
+                stats["total_events_scanned"] = total_events_scanned
+                stats["total_whale_walls_found"] = total_whale_walls_found
                 if cycle % 10 == 0:
                     update_tracked_positions(client, notifier, state)
                     log_top_traders(state)
