@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 
 from src.analyzer import TradeAnalyzer
 from src.notifications import TelegramNotifier
 from src.polymarket_api import PolyClient
 from src.storage import BotStateStorage
+from src.config import POLL_INTERVAL_S, SAVE_INTERVAL_CYCLES
 
 
 logging.basicConfig(
@@ -161,6 +163,10 @@ def update_tracked_positions(
             continue
 
         market_details = client.get_market_details(str(condition_id))
+        if not market_details:
+            logger.warning("Market details unavailable for condition_id=%s", condition_id)
+            updated_positions.append(position)
+            continue
         market_title = (
             market_details.get("question")
             or market_details.get("title")
@@ -201,7 +207,7 @@ def process_trades(
 ) -> None:
     analyzer = TradeAnalyzer(trades)
     whale_trades = analyzer.find_whale_trades()
-    processed_trade_ids = state.get("processed_trade_ids", [])
+    processed_trade_ids = deque(state.get("processed_trade_ids", []), maxlen=1000)
     processed_trade_id_set = set(processed_trade_ids)
     trader_stats = state.get("trader_stats", {})
 
@@ -230,11 +236,12 @@ def process_trades(
             market_title = None
             if condition_id:
                 market_details = client.get_market_details(str(condition_id))
-                market_title = (
-                    market_details.get("question")
-                    or market_details.get("title")
-                    or market_details.get("name")
-                )
+                if market_details:
+                    market_title = (
+                        market_details.get("question")
+                        or market_details.get("title")
+                        or market_details.get("name")
+                    )
             entry_price = trade.get("price")
             if entry_price is not None:
                 try:
@@ -266,7 +273,7 @@ def process_trades(
         processed_trade_ids.append(trade_id)
         processed_trade_id_set.add(trade_id)
 
-    state["processed_trade_ids"] = processed_trade_ids
+    state["processed_trade_ids"] = list(processed_trade_ids)
     state["trader_stats"] = trader_stats
 
 
@@ -287,9 +294,10 @@ def main() -> None:
             if cycle % 10 == 0:
                 update_tracked_positions(client, notifier, state)
             storage.cleanup(state)
-            storage.save(state)
+            if cycle % SAVE_INTERVAL_CYCLES == 0:
+                storage.save(state)
 
-        time.sleep(60)
+        time.sleep(POLL_INTERVAL_S)
         cycle += 1
 
 

@@ -5,12 +5,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import time
+
 import requests
 
 from src.config import (
     BASE_API_URL,
     DEFAULT_TIMEOUT_S,
     DEFAULT_TRADE_LIMIT,
+    MARKETS_ENDPOINT,
+    RATE_LIMIT_BACKOFF_S,
     TRADES_ENDPOINT,
 )
 
@@ -23,6 +27,30 @@ class PolyClient:
     def __init__(self, base_url: str | None = None, timeout_s: int | None = None) -> None:
         self.base_url = base_url or BASE_API_URL
         self.timeout_s = timeout_s or DEFAULT_TIMEOUT_S
+        self.session = requests.Session()
+
+    def _get(self, url: str, params: dict[str, Any] | None = None) -> dict | list | None:
+        try:
+            response = self.session.get(url, params=params, timeout=self.timeout_s)
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                sleep_for = RATE_LIMIT_BACKOFF_S
+                if retry_after:
+                    try:
+                        sleep_for = int(retry_after)
+                    except ValueError:
+                        logger.warning("Invalid Retry-After header: %s", retry_after)
+                logger.warning("Rate limited (429). Backing off for %ss", sleep_for)
+                time.sleep(sleep_for)
+                return None
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            logger.exception("Request failed: %s", exc)
+            return None
+        except ValueError as exc:
+            logger.exception("Failed to parse JSON response: %s", exc)
+            return None
 
     def fetch_latest_trades(self, limit: int = DEFAULT_TRADE_LIMIT) -> list[dict[str, Any]]:
         """Fetch latest trades from the CLOB API."""
@@ -31,15 +59,8 @@ class PolyClient:
 
         logger.info("Fetching latest trades from %s", url)
 
-        try:
-            response = requests.get(url, params=params, timeout=self.timeout_s)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
-            logger.exception("Failed to fetch latest trades: %s", exc)
-            return []
-        except ValueError as exc:
-            logger.exception("Failed to parse trades response: %s", exc)
+        payload = self._get(url, params=params)
+        if payload is None:
             return []
 
         if isinstance(payload, dict) and "trades" in payload:
@@ -56,15 +77,8 @@ class PolyClient:
 
         logger.info("Fetching market details from %s", url)
 
-        try:
-            response = requests.get(url, timeout=self.timeout_s)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
-            logger.exception("Failed to fetch market details: %s", exc)
-            return {}
-        except ValueError as exc:
-            logger.exception("Failed to parse market details: %s", exc)
+        payload = self._get(url)
+        if payload is None:
             return {}
 
         if isinstance(payload, dict):
@@ -72,3 +86,21 @@ class PolyClient:
 
         logger.warning("Unexpected market details format: %s", type(payload))
         return {}
+
+    def fetch_markets(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Fetch market summaries for volume/liquidity analysis."""
+        url = f"{self.base_url}{MARKETS_ENDPOINT}"
+        params = {"limit": limit}
+
+        logger.info("Fetching market summaries from %s", url)
+        payload = self._get(url, params=params)
+        if payload is None:
+            return []
+
+        if isinstance(payload, dict) and "markets" in payload:
+            return payload["markets"]
+        if isinstance(payload, list):
+            return payload
+
+        logger.warning("Unexpected markets response format: %s", type(payload))
+        return []
