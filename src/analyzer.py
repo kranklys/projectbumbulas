@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,8 @@ def compute_signal_score(
     market_details: dict[str, Any] | None,
     reputation_count: int,
     impact: float | None,
+    repeat_offender: bool = False,
+    repeat_offender_bonus: int = 10,
 ) -> tuple[int, list[str]]:
     """Compute a 0-100 signal score with reasons."""
     reasons: list[str] = []
@@ -124,6 +127,10 @@ def compute_signal_score(
         score += 10
         reasons.append("Frequent trader activity")
 
+    if repeat_offender:
+        score += repeat_offender_bonus
+        reasons.append("Repeat offender watchlist activity")
+
     if market_details:
         volume = _extract_volume_24h(market_details)
         if volume is not None:
@@ -139,6 +146,28 @@ def compute_signal_score(
 
     score = max(0, min(100, score))
     return score, reasons
+
+
+def evaluate_signal_density(
+    entries: list[dict[str, Any]],
+    condition_id: str | None,
+    window_seconds: int = 3600,
+    min_entries: int = 3,
+) -> tuple[str, int]:
+    """Classify signal density based on smart wallet entries in a time window."""
+    if not condition_id:
+        return "Standard", 0
+    now = time.time()
+    recent_entries = [
+        entry
+        for entry in entries
+        if entry.get("condition_id") == condition_id
+        and now - entry.get("timestamp", 0) <= window_seconds
+    ]
+    count = len(recent_entries)
+    if count >= min_entries:
+        return "CONFIRMED MOMENTUM", count
+    return "Standard", count
 
 
 def assess_market_risk(

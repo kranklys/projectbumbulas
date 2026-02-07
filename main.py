@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from collections import deque
 
@@ -10,6 +12,7 @@ from src.analyzer import (
     TradeAnalyzer,
     assess_market_risk,
     compute_signal_score,
+    evaluate_signal_density,
     track_market_volumes,
 )
 from src.notifications import TelegramNotifier
@@ -29,6 +32,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+TRADER_HISTORY_PATH = os.path.join("data", "trader_history.json")
+REPEAT_OFFENDER_BONUS = 10
+SMART_WALLET_WINDOW_S = 60 * 60
+SMART_WALLET_THRESHOLD = 3
+
 
 def format_trade_message(
     trade: dict,
@@ -43,6 +51,7 @@ def format_trade_message(
     risk_reasons: list[str] | None = None,
     signal_type: str | None = None,
     signal_density: str | None = None,
+    priority_multiplier: int = 1,
 ) -> str:
     value = trade.get("estimated_usd_value")
     trader = (
@@ -64,6 +73,7 @@ def format_trade_message(
     risk_reason_text = ", ".join(risk_reasons or []) or "N/A"
     signal_type_label = signal_type or "Standard"
     density_label = signal_density or "N/A"
+    priority_label = f"x{priority_multiplier}"
 
     return (
         f"{header}\n\n"
@@ -78,6 +88,7 @@ def format_trade_message(
         f"🧾 Risk Factors: {risk_reason_text}\n\n"
         f"🏷️ Signal Type: {signal_type_label}\n"
         f"📊 Signal Density: {density_label}\n\n"
+        f"🚦 Priority: {priority_label}\n\n"
         f"👤 Trader: {trader}\n\n"
         f"🔗 Link: {link}"
     )
@@ -206,6 +217,20 @@ def update_recent_market_signals(state: dict, condition_id: str | None) -> None:
     state["recent_market_signals"] = recent
 
 
+def update_recent_smart_wallet_entries(
+    state: dict,
+    condition_id: str | None,
+    trader: str,
+) -> None:
+    if not condition_id:
+        return
+    recent = state.get("smart_wallet_entries", [])
+    recent.append(
+        {"timestamp": time.time(), "condition_id": condition_id, "trader": trader}
+    )
+    state["smart_wallet_entries"] = recent
+
+
 def update_recent_volume_spikes(state: dict, market_id: str) -> None:
     recent = state.get("recent_volume_spikes", [])
     recent.append({"timestamp": time.time(), "market_id": market_id})
@@ -235,14 +260,34 @@ def get_sentiment(state: dict) -> str:
     return "Neutral"
 
 
-def get_signal_context(state: dict, condition_id: str | None) -> tuple[str, str]:
+def get_signal_context(
+    state: dict, condition_id: str | None
+) -> tuple[str, str, int]:
     now = time.time()
     market_signals = state.get("recent_market_signals", [])
     volume_spikes = state.get("recent_volume_spikes", [])
+    smart_wallet_entries = state.get("smart_wallet_entries", [])
 
     signals_15m = sum(1 for s in market_signals if now - s.get("timestamp", 0) <= 900)
     signals_60m = sum(1 for s in market_signals if now - s.get("timestamp", 0) <= 3600)
     density_label = f"15m:{signals_15m} | 60m:{signals_60m}"
+
+    density_status, smart_wallet_count = evaluate_signal_density(
+        smart_wallet_entries,
+        condition_id,
+        window_seconds=SMART_WALLET_WINDOW_S,
+        min_entries=SMART_WALLET_THRESHOLD,
+    )
+    cutoff = now - SMART_WALLET_WINDOW_S
+    state["smart_wallet_entries"] = [
+        entry
+        for entry in smart_wallet_entries
+        if entry.get("timestamp", 0) >= cutoff
+    ]
+
+    if density_status == "CONFIRMED MOMENTUM":
+        density_label = f"{density_label} | smart_wallets:{smart_wallet_count}"
+        return "CONFIRMED MOMENTUM", density_label, 2
 
     if condition_id:
         recent_spike = any(
@@ -255,11 +300,58 @@ def get_signal_context(state: dict, condition_id: str | None) -> tuple[str, str]
             if s.get("condition_id") == condition_id and now - s.get("timestamp", 0) <= 900
         )
         if recent_spike and recent_market_signals >= 2:
-            return "Confirmed", density_label
+            return "Confirmed", density_label, 1
         if recent_market_signals >= 3:
-            return "Momentum", density_label
+            return "Momentum", density_label, 1
 
-    return "Standard", density_label
+    return "Standard", density_label, 1
+
+
+def load_trader_history(path: str = TRADER_HISTORY_PATH) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Failed to load trader history from %s", path)
+        return {}
+
+
+def save_trader_history(history: dict, path: str = TRADER_HISTORY_PATH) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=2, sort_keys=True)
+
+
+def log_signal_event(
+    signal_type: str,
+    priority_multiplier: int,
+    market_title: str | None,
+    trader: str,
+    score: int,
+    risk_label: str,
+    reasons: list[str],
+) -> None:
+    title = market_title or "Unknown"
+    header = "✅ CONFIRMED MOMENTUM" if signal_type == "CONFIRMED MOMENTUM" else "🐳 NORMAL WHALE"
+    logger.info(
+        "\n%s\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 Market: %s\n"
+        "👤 Trader: %s\n"
+        "✅ Score: %s/100 | Priority: x%s\n"
+        "⚠️ Risk: %s\n"
+        "🧩 Reasons: %s\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        header,
+        title,
+        trader,
+        score,
+        priority_multiplier,
+        risk_label,
+        ", ".join(reasons) or "N/A",
+    )
 
 
 def update_tracked_positions(
@@ -352,6 +444,7 @@ def process_trades(
     notifier: TelegramNotifier,
     client: PolyClient,
     state: dict,
+    trader_history: dict,
 ) -> None:
     analyzer = TradeAnalyzer(trades)
     whale_trades = analyzer.find_whale_trades()
@@ -396,35 +489,28 @@ def process_trades(
                         or market_details.get("title")
                         or market_details.get("name")
                     )
+            history_entry = trader_history.get(trader_key, {})
+            repeat_offender = is_watchlisted and history_entry.get("count", 0) > 0
             risk_label, risk_reasons = assess_market_risk(
                 market_details,
                 min_volume=MIN_MARKET_VOLUME,
                 max_spread_pct=MAX_SPREAD_PCT,
             )
-            if risk_label == "High":
-                logger.info(
-                    "Skipping alert due to high market risk: %s (%s)",
-                    risk_label,
-                    ", ".join(risk_reasons),
-                )
-                processed_trade_ids.append(trade_id)
-                processed_trade_id_set.add(trade_id)
-                continue
             entry_price = trade.get("price")
             if entry_price is not None:
                 try:
                     entry_price = float(entry_price)
                 except (TypeError, ValueError):
                     entry_price = None
-            logger.info(
-                "Smart trade detected | watchlisted=%s | high_impact=%s | trade=%s",
-                is_watchlisted,
-                is_high_impact,
-                trade,
-            )
             update_recent_smart_trades(state, trade)
             update_recent_market_signals(state, str(condition_id) if condition_id else None)
-            signal_type, signal_density = get_signal_context(
+            if is_watchlisted and condition_id:
+                update_recent_smart_wallet_entries(
+                    state,
+                    str(condition_id),
+                    trader_key,
+                )
+            signal_type, signal_density, priority_multiplier = get_signal_context(
                 state,
                 str(condition_id) if condition_id else None,
             )
@@ -433,6 +519,32 @@ def process_trades(
                 market_details,
                 trader_stats[trader_key],
                 impact,
+                repeat_offender=repeat_offender,
+                repeat_offender_bonus=REPEAT_OFFENDER_BONUS,
+            )
+            if risk_label == "High" and score <= 90:
+                logger.info(
+                    "🚫 Guarded alert skipped | Risk: %s | Score: %s | Reasons: %s",
+                    risk_label,
+                    score,
+                    ", ".join(risk_reasons) or "N/A",
+                )
+                trader_history[trader_key] = {
+                    "count": history_entry.get("count", 0) + 1,
+                    "last_seen": time.time(),
+                    "watchlist": is_watchlisted,
+                }
+                processed_trade_ids.append(trade_id)
+                processed_trade_id_set.add(trade_id)
+                continue
+            log_signal_event(
+                signal_type,
+                priority_multiplier,
+                market_title,
+                trader_key,
+                score,
+                risk_label,
+                reasons,
             )
             message = format_trade_message(
                 trade,
@@ -447,8 +559,14 @@ def process_trades(
                 risk_reasons=risk_reasons,
                 signal_type=signal_type,
                 signal_density=signal_density,
+                priority_multiplier=priority_multiplier,
             )
             notifier.send_message(message)
+            trader_history[trader_key] = {
+                "count": history_entry.get("count", 0) + 1,
+                "last_seen": time.time(),
+                "watchlist": is_watchlisted,
+            }
             add_tracked_position(
                 state,
                 trade_id,
@@ -491,6 +609,7 @@ def main() -> None:
     notifier = TelegramNotifier()
     storage = BotStateStorage()
     state = storage.load()
+    trader_history = load_trader_history()
     logger.info("Starting Polymarket Smart Money tracker loop.")
     cycle = 0
 
@@ -499,13 +618,14 @@ def main() -> None:
         if not trades:
             logger.warning("No trades returned from API.")
         else:
-            process_trades(trades, notifier, client, state)
+            process_trades(trades, notifier, client, state, trader_history)
             if cycle % 10 == 0:
                 update_tracked_positions(client, notifier, state)
                 log_top_traders(state)
             storage.cleanup(state)
             if cycle % SAVE_INTERVAL_CYCLES == 0:
                 storage.save(state)
+                save_trader_history(trader_history)
 
         time.sleep(POLL_INTERVAL_S)
         cycle += 1
