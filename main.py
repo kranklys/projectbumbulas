@@ -7,7 +7,8 @@ import logging
 import os
 import statistics
 import time
-from collections import deque
+from collections import Counter, deque
+from datetime import datetime, timezone
 
 from src.analyzer import (
     TradeAnalyzer,
@@ -32,6 +33,9 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+import matplotlib
+import matplotlib.pyplot as plt
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,8 +43,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+matplotlib.use("Agg")
+
 TRADER_HISTORY_PATH = os.path.join("data", "trader_history.json")
 DISCOVERED_WHALES_PATH = os.path.join("data", "discovered_whales.json")
+SIGNAL_HISTORY_PATH = os.path.join("data", "signal_history.json")
+REPORTS_DIR = os.path.join("data", "reports")
 REPEAT_OFFENDER_BONUS = 10
 SMART_WALLET_WINDOW_S = 60 * 60
 SMART_WALLET_THRESHOLD = 3
@@ -53,6 +61,7 @@ MARKET_TREND_WINDOW_S = 15 * 60
 DISCOVERY_WINDOW_S = 24 * 60 * 60
 DISCOVERY_SCORE_THRESHOLD = 70
 DISCOVERY_MIN_TRADES = 4
+SIGNAL_HISTORY_RETENTION_DAYS = 14
 
 COLOR_MOMENTUM = "\033[95m"
 COLOR_WHALE = "\033[94m"
@@ -602,6 +611,229 @@ def save_trader_history(history: dict, path: str = TRADER_HISTORY_PATH) -> None:
         json.dump(history, handle, indent=2, sort_keys=True)
 
 
+def load_signal_history(path: str = SIGNAL_HISTORY_PATH) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Failed to load signal history from %s", path)
+        return []
+    if isinstance(data, list):
+        return [entry for entry in data if isinstance(entry, dict)]
+    return []
+
+
+def save_signal_history(history: list[dict], path: str = SIGNAL_HISTORY_PATH) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=2, sort_keys=True)
+
+
+def prune_signal_history(history: list[dict]) -> list[dict]:
+    cutoff = time.time() - SIGNAL_HISTORY_RETENTION_DAYS * 24 * 60 * 60
+    return [entry for entry in history if entry.get("timestamp", 0) >= cutoff]
+
+
+def record_signal_history(
+    history: list[dict],
+    trade: dict,
+    score: int,
+    reasons: list[str],
+    market_title: str | None,
+    market_url: str | None,
+    risk_label: str,
+    signal_type: str,
+    momentum_alert: str | None,
+) -> None:
+    history.append(
+        {
+            "timestamp": time.time(),
+            "trade_id": trade.get("id"),
+            "market_title": market_title or "Unknown",
+            "market_url": market_url or trade.get("marketUrl") or trade.get("url"),
+            "trader": trade.get("trader")
+            or trade.get("taker")
+            or trade.get("maker")
+            or trade.get("wallet"),
+            "score": score,
+            "reasons": reasons,
+            "risk": risk_label,
+            "signal_type": signal_type,
+            "momentum": momentum_alert is not None,
+            "estimated_usd_value": trade.get("estimated_usd_value"),
+        }
+    )
+
+
+def _format_currency(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"${float(value):,.0f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _format_date_label(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def generate_signal_charts(
+    recent_signals: list[dict],
+    report_dir: str,
+    report_label: str,
+) -> dict[str, str]:
+    os.makedirs(report_dir, exist_ok=True)
+    chart_paths: dict[str, str] = {}
+    if not recent_signals:
+        return chart_paths
+
+    timestamps = [entry.get("timestamp", 0) for entry in recent_signals]
+    hours = [
+        datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:00")
+        for ts in timestamps
+        if ts
+    ]
+    hour_counts = Counter(hours)
+    hour_labels = sorted(hour_counts.keys())
+    counts = [hour_counts[label] for label in hour_labels]
+
+    plt.figure(figsize=(10, 4))
+    plt.bar(hour_labels, counts, color="#4C78A8")
+    plt.title("Signals per Hour (UTC)")
+    plt.xlabel("Hour")
+    plt.ylabel("Signals")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    signals_chart = os.path.join(report_dir, f"signals_per_hour_{report_label}.png")
+    plt.savefig(signals_chart)
+    plt.close()
+    chart_paths["signals_per_hour"] = signals_chart
+
+    top_markets = Counter(
+        entry.get("market_title", "Unknown") for entry in recent_signals
+    ).most_common(5)
+    if top_markets:
+        labels = [item[0] for item in top_markets]
+        values = [item[1] for item in top_markets]
+        plt.figure(figsize=(10, 4))
+        plt.barh(labels, values, color="#F58518")
+        plt.title("Top Markets by Signal Count")
+        plt.xlabel("Signals")
+        plt.tight_layout()
+        markets_chart = os.path.join(report_dir, f"top_markets_{report_label}.png")
+        plt.savefig(markets_chart)
+        plt.close()
+        chart_paths["top_markets"] = markets_chart
+
+    return chart_paths
+
+
+def generate_daily_report(
+    signal_history: list[dict],
+    state: dict,
+    report_dir: str = REPORTS_DIR,
+) -> dict[str, str]:
+    now = time.time()
+    report_label = _format_date_label(now)
+    cutoff = now - 24 * 60 * 60
+    recent_signals = [entry for entry in signal_history if entry.get("timestamp", 0) >= cutoff]
+
+    top_signals = sorted(
+        recent_signals, key=lambda entry: entry.get("score", 0), reverse=True
+    )[:10]
+    trader_counts = Counter(
+        entry.get("trader", "Unknown") for entry in recent_signals if entry.get("trader")
+    ).most_common(5)
+
+    profiles = state.get("trader_profiles", {})
+    top_profit = sorted(
+        profiles.items(),
+        key=lambda item: item[1].get("total_profit", 0),
+        reverse=True,
+    )[:5]
+
+    charts = generate_signal_charts(recent_signals, report_dir, report_label)
+
+    summary = {
+        "date": report_label,
+        "signals_count": len(recent_signals),
+        "top_signals": top_signals,
+        "top_traders": [
+            {"trader": trader, "signals": count} for trader, count in trader_counts
+        ],
+        "top_profit": [
+            {
+                "trader": trader,
+                "total_profit": data.get("total_profit", 0),
+                "winrate": data.get("winrate"),
+            }
+            for trader, data in top_profit
+        ],
+        "charts": charts,
+    }
+
+    os.makedirs(report_dir, exist_ok=True)
+    summary_path = os.path.join(report_dir, f"daily_summary_{report_label}.json")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+
+    html_path = os.path.join(report_dir, f"daily_report_{report_label}.html")
+    with open(html_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "<html><head><meta charset='utf-8'>"
+            "<title>Daily Bot Report</title>"
+            "<style>body{font-family:Arial,sans-serif;padding:20px;} "
+            "table{border-collapse:collapse;width:100%;margin-bottom:20px;} "
+            "th,td{border:1px solid #ddd;padding:8px;} "
+            "th{background:#f2f2f2;text-align:left;}</style>"
+            "</head><body>"
+            f"<h1>Daily Report - {report_label} (UTC)</h1>"
+            f"<p>Total signals: {len(recent_signals)}</p>"
+            "<h2>Top Signals</h2>"
+            "<table><tr><th>Market</th><th>Score</th><th>Trader</th><th>Value</th><th>Link</th></tr>"
+        )
+        for entry in top_signals:
+            handle.write(
+                "<tr>"
+                f"<td>{entry.get('market_title','Unknown')}</td>"
+                f"<td>{entry.get('score','-')}</td>"
+                f"<td>{entry.get('trader','Unknown')}</td>"
+                f"<td>{_format_currency(entry.get('estimated_usd_value'))}</td>"
+                f"<td><a href='{entry.get('market_url','')}'>{entry.get('market_url','')}</a></td>"
+                "</tr>"
+            )
+        handle.write("</table>")
+        handle.write("<h2>Top Traders (Signals)</h2>")
+        handle.write("<table><tr><th>Trader</th><th>Signals</th></tr>")
+        for trader, count in trader_counts:
+            handle.write(f"<tr><td>{trader}</td><td>{count}</td></tr>")
+        handle.write("</table>")
+        handle.write("<h2>Top Profit Traders</h2>")
+        handle.write("<table><tr><th>Trader</th><th>Total Profit</th><th>Winrate</th></tr>")
+        for trader, data in top_profit:
+            winrate = data.get("winrate")
+            winrate_label = f"{winrate:.2%}" if isinstance(winrate, float) else "N/A"
+            handle.write(
+                "<tr>"
+                f"<td>{trader}</td>"
+                f"<td>{data.get('total_profit',0):.4f}</td>"
+                f"<td>{winrate_label}</td>"
+                "</tr>"
+            )
+        handle.write("</table>")
+        if charts.get("signals_per_hour"):
+            handle.write("<h2>Signal History Charts</h2>")
+            for label, path in charts.items():
+                filename = os.path.basename(path)
+                handle.write(f"<div><img src='{filename}' style='max-width:100%;'></div>")
+        handle.write("</body></html>")
+
+    return {"summary": summary_path, "html": html_path}
+
+
 def log_signal_event(
     signal_type: str,
     priority_multiplier: int,
@@ -747,6 +979,7 @@ def process_trades(
     trader_history: dict,
     history_manager: HistoryManager,
     discovered_watchlist: set[str],
+    signal_history: list[dict],
 ) -> dict:
     stats: dict[str, object] = {
         "fetched_trades": len(trades),
@@ -942,6 +1175,17 @@ def process_trades(
             stats["last_score"] = score
             stats["last_market"] = market_title or "Unknown"
             stats["last_url"] = market_url or "N/A"
+            record_signal_history(
+                signal_history,
+                trade,
+                score,
+                reasons,
+                market_title,
+                market_url,
+                risk_label,
+                signal_type,
+                momentum_alert,
+            )
             trader_history[trader_key] = {
                 "count": history_entry.get("count", 0) + 1,
                 "last_seen": time.time(),
@@ -1006,6 +1250,7 @@ def main() -> None:
     state = storage.load()
     trader_history = load_trader_history()
     discovered_watchlist = load_discovered_whales()
+    signal_history = load_signal_history()
     history_manager = HistoryManager(retention_seconds=CLEANUP_RETENTION_S)
     dashboard = Dashboard()
     logger.info("Starting Polymarket Smart Money tracker loop.")
@@ -1041,15 +1286,30 @@ def main() -> None:
                     trader_history,
                     history_manager,
                     discovered_watchlist,
+                    signal_history,
                 )
                 stats["cycle"] = cycle
                 if cycle % 10 == 0:
                     update_tracked_positions(client, notifier, state)
                     log_top_traders(state)
-                storage.cleanup(state)
-                if cycle % SAVE_INTERVAL_CYCLES == 0:
-                    storage.save(state)
-                    save_trader_history(trader_history)
+
+            storage.cleanup(state)
+            if cycle % SAVE_INTERVAL_CYCLES == 0:
+                storage.save(state)
+                save_trader_history(trader_history)
+                signal_history = prune_signal_history(signal_history)
+                save_signal_history(signal_history)
+
+            report_date = _format_date_label(time.time())
+            last_report_date = state.get("last_daily_report_date")
+            if last_report_date != report_date:
+                report_paths = generate_daily_report(signal_history, state)
+                state["last_daily_report_date"] = report_date
+                logger.info(
+                    "Daily report generated: %s (HTML: %s)",
+                    report_paths.get("summary"),
+                    report_paths.get("html"),
+                )
 
             cleanup_state_memory(state, history_manager)
             dashboard.update(stats, state)
