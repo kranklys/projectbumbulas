@@ -37,9 +37,11 @@ from src.backtest import (
     run_backtest,
     run_backtest_from_trades,
 )
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -186,6 +188,31 @@ def estimate_price_impact(trade: dict) -> float | None:
     if previous_price == 0:
         return None
     return abs(current_price - previous_price) / previous_price
+
+
+def _format_trade_feed_entry(
+    trade: dict,
+    amount: float,
+    side: str | None,
+) -> str:
+    market_name = (
+        trade.get("marketTitle")
+        or trade.get("market_title")
+        or trade.get("title")
+        or trade.get("question")
+        or trade.get("market")
+        or "Unknown"
+    )
+    price = trade.get("price") or "N/A"
+    side_label = side or "N/A"
+    if side_label.upper() == "BUY":
+        side_label = "[green]BUY[/green]"
+    elif side_label.upper() == "SELL":
+        side_label = "[red]SELL[/red]"
+    return (
+        f"[TRADE] Market: {market_name} | Side: {side_label} | "
+        f"Amount: ${amount:,.2f} | Price: {price}"
+    )
 
 
 def get_current_market_price(market_details: dict) -> float | None:
@@ -412,12 +439,17 @@ class Dashboard:
     def update(self, stats: dict, state: dict) -> None:
         self.live.update(self._render(stats, state), refresh=True)
 
-    def _render(self, stats: dict, state: dict) -> Table:
+    def _render(self, stats: dict, state: dict) -> Group:
         table = Table(title="📊 Polymarket Smart Money Dashboard", expand=True)
         table.add_column("Metric", style="bold cyan")
         table.add_column("Value", style="magenta")
         table.add_row("Cycle", str(stats.get("cycle", "-")))
-        table.add_row("Fetched Trades", str(stats.get("fetched_trades", 0)))
+        total_trades = stats.get("total_trades_scanned", 0)
+        new_trades = stats.get("new_trades", 0)
+        table.add_row(
+            "Trade Activity",
+            f"Total Trades Scanned: {total_trades} | New Trades this Cycle: {new_trades}",
+        )
         table.add_row("Whale Trades", str(stats.get("whale_trades", 0)))
         table.add_row("Alerts Sent", str(stats.get("alerts_sent", 0)))
         table.add_row("Elite Wallets", str(len(state.get("elite_smart_wallets", []))))
@@ -426,7 +458,16 @@ class Dashboard:
         table.add_row("Last Market", stats.get("last_market", "-"))
         table.add_row("Last URL", stats.get("last_url", "-"))
         table.add_row("Seen Trades (24h)", str(len(state.get("seen_trades", []))))
-        return table
+        feed_entries = stats.get("trade_feed") or []
+        feed_text = Text.from_markup("\n".join(feed_entries)) if feed_entries else Text(
+            "No trades fetched yet."
+        )
+        feed_panel = Panel(
+            feed_text,
+            title="Live Feed (Latest Trades)",
+            border_style="cyan",
+        )
+        return Group(table, feed_panel)
 
 
 def add_tracked_position(
@@ -1159,12 +1200,13 @@ def process_trades(
     virtual_trades: list[dict],
 ) -> dict:
     stats: dict[str, object] = {
-        "fetched_trades": len(trades),
+        "new_trades": 0,
         "whale_trades": 0,
         "alerts_sent": 0,
         "last_score": None,
         "last_market": None,
         "last_url": None,
+        "trade_feed": [],
     }
     normalized_trades = []
     for index, trade in enumerate(trades):
@@ -1173,25 +1215,39 @@ def process_trades(
             continue
         normalized_trades.append(normalize_trade(trade, index))
 
-    if not normalized_trades:
-        logger.warning("No valid trades to process after normalization.")
-        return stats
-
-    analyzer = TradeAnalyzer(
-        normalized_trades, watchlist=set(WATCHLIST_ADDRESSES) | discovered_watchlist
-    )
-    whale_trades = analyzer.find_whale_trades()
-    stats["whale_trades"] = len(whale_trades)
     now = time.time()
     seen_trades = deque(normalize_seen_trades(state, now), maxlen=2000)
     seen_trade_id_set = {entry.get("trade_id") for entry in seen_trades}
+    analyzer = TradeAnalyzer(
+        normalized_trades, watchlist=set(WATCHLIST_ADDRESSES) | discovered_watchlist
+    )
+    new_trades, new_trade_ids = analyzer.filter_new_trades(seen_trade_id_set)
+    stats["new_trades"] = len(new_trades)
+    if not new_trades:
+        logger.warning("No new trades to process after deduplication.")
+        stats["trade_feed"] = ["No new trades this cycle."]
+        return stats
+    for trade_id in new_trade_ids:
+        seen_trades.append({"trade_id": trade_id, "timestamp": now})
+
+    feed_entries = []
+    min_trade_usd = 100.0
+    for trade in new_trades[:10]:
+        amount = analyzer.estimate_trade_value_usd(trade)
+        side = extract_trade_side(trade)
+        if amount < min_trade_usd:
+            feed_entries.append(f"[SKIP] Small trade of ${amount:,.2f}")
+            continue
+        feed_entries.append(_format_trade_feed_entry(trade, amount, side))
+    stats["trade_feed"] = feed_entries
+
+    whale_trades = analyzer.find_whale_trades(new_trades)
+    stats["whale_trades"] = len(whale_trades)
     trader_stats = state.get("trader_stats", {})
     trader_profiles = state.get("trader_profiles", {})
 
     for index, trade in enumerate(whale_trades):
         trade_id = str(trade.get("id") or get_trade_id(trade, index))
-        if trade_id in seen_trade_id_set:
-            continue
 
         is_watchlisted = analyzer.is_watchlist_trade(trade)
         is_high_impact = analyzer.is_high_impact(trade)
@@ -1330,8 +1386,6 @@ def process_trades(
                     "last_seen": time.time(),
                     "watchlist": is_watchlisted,
                 }
-                seen_trades.append({"trade_id": trade_id, "timestamp": time.time()})
-                seen_trade_id_set.add(trade_id)
                 continue
             log_signal_event(
                 signal_type,
@@ -1400,9 +1454,6 @@ def process_trades(
                 trade.get("trader") or "Unknown",
                 trade.get("estimated_usd_value"),
             )
-
-        seen_trades.append({"trade_id": trade_id, "timestamp": time.time()})
-        seen_trade_id_set.add(trade_id)
 
     state["seen_trades"] = list(seen_trades)
     state["trader_stats"] = trader_stats
@@ -1487,6 +1538,7 @@ def main() -> None:
     cycle = 0
     last_virtual_check = 0.0
     last_performance_report = 0.0
+    total_trades_scanned = int(state.get("total_trades_scanned", 0))
 
     dashboard.start()
     try:
@@ -1508,7 +1560,12 @@ def main() -> None:
                     time.sleep(FETCH_RETRY_BACKOFF_S * attempt)
             if not trades:
                 logger.warning("No trades returned from API.")
-                stats = {"cycle": cycle, "fetched_trades": 0}
+                stats = {
+                    "cycle": cycle,
+                    "new_trades": 0,
+                    "total_trades_scanned": total_trades_scanned,
+                    "trade_feed": ["No trades returned from API."],
+                }
             else:
                 stats = process_trades(
                     trades,
@@ -1522,6 +1579,9 @@ def main() -> None:
                     virtual_trades,
                 )
                 stats["cycle"] = cycle
+                total_trades_scanned += int(stats.get("new_trades", 0))
+                state["total_trades_scanned"] = total_trades_scanned
+                stats["total_trades_scanned"] = total_trades_scanned
                 if cycle % 10 == 0:
                     update_tracked_positions(client, notifier, state)
                     log_top_traders(state)
