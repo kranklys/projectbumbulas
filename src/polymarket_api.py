@@ -115,6 +115,20 @@ class PolyClient:
         logger.warning("Unexpected events response format: %s", type(payload))
         return []
 
+    def fetch_active_markets(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Fetch active markets from the Gamma API."""
+        url = f"{self.public_base_url}/markets"
+        params = {"active": "true", "closed": "false", "limit": limit}
+        payload = self._get(url, params=params, allow_fallback=False)
+        if payload is None:
+            return []
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict) and "markets" in payload:
+            return payload["markets"]
+        logger.warning("Unexpected markets response format: %s", type(payload))
+        return []
+
     def fetch_token_price(self, token_id: str) -> dict[str, Any]:
         """Fetch latest token price from the CLOB API."""
         url = f"{self.clob_base_url}/price"
@@ -134,59 +148,62 @@ class PolyClient:
         return {}
 
     def fetch_latest_trades(self, limit: int = DEFAULT_TRADE_LIMIT) -> list[dict[str, Any]]:
-        """Build synthetic trade activity from events, prices, and orderbooks."""
-        logger.info("Fetching latest activity from Gamma events + CLOB price/book.")
-        events = self.fetch_active_events(limit=10)
-        if not events:
-            logger.warning("No active events returned from Gamma API.")
+        """Build synthetic trade activity from Gamma markets and CLOB price/book."""
+        logger.info("Fetching latest activity from Gamma markets + CLOB price/book.")
+        markets = self.fetch_active_markets(limit=limit)
+        if not markets:
+            logger.warning("No active markets returned from Gamma API.")
             return []
 
         activity: list[dict[str, Any]] = []
-        for event in events:
-            title = event.get("title") or event.get("question") or "Unknown"
-            markets = event.get("markets") or []
-            for market in markets:
-                token_ids = market.get("clobTokenIds") or []
-                for token_id in token_ids:
-                    price_payload = self.fetch_token_price(str(token_id))
-                    price = price_payload.get("price")
-                    book = self.fetch_orderbook(str(token_id))
-                    bids = book.get("bids") or []
-                    asks = book.get("asks") or []
-                    if not bids and not asks:
+        for market in markets:
+            title = (
+                market.get("question")
+                or market.get("title")
+                or market.get("name")
+                or "Unknown"
+            )
+            token_ids = market.get("clobTokenIds") or []
+            for token_id in token_ids:
+                price_payload = self.fetch_token_price(str(token_id))
+                price = price_payload.get("price")
+                book = self.fetch_orderbook(str(token_id))
+                bids = book.get("bids") or []
+                asks = book.get("asks") or []
+                if not bids and not asks:
+                    continue
+                max_bid = max(
+                    bids,
+                    key=lambda entry: float(entry.get("size", 0)),
+                    default=None,
+                )
+                max_ask = max(
+                    asks,
+                    key=lambda entry: float(entry.get("size", 0)),
+                    default=None,
+                )
+                for side_label, entry in (("BUY", max_bid), ("SELL", max_ask)):
+                    if not entry:
                         continue
-                    max_bid = max(
-                        bids,
-                        key=lambda entry: float(entry.get("size", 0)),
-                        default=None,
+                    try:
+                        size = float(entry.get("size", 0))
+                    except (TypeError, ValueError):
+                        size = 0.0
+                    if size <= 0:
+                        continue
+                    entry_price = entry.get("price") or price
+                    activity.append(
+                        {
+                            "marketTitle": title,
+                            "price": entry_price,
+                            "side": side_label,
+                            "amount": size,
+                            "token_id": str(token_id),
+                            "event_id": market.get("eventId"),
+                        }
                     )
-                    max_ask = max(
-                        asks,
-                        key=lambda entry: float(entry.get("size", 0)),
-                        default=None,
-                    )
-                    for side_label, entry in (("BUY", max_bid), ("SELL", max_ask)):
-                        if not entry:
-                            continue
-                        try:
-                            size = float(entry.get("size", 0))
-                        except (TypeError, ValueError):
-                            size = 0.0
-                        if size <= 0:
-                            continue
-                        entry_price = entry.get("price") or price
-                        activity.append(
-                            {
-                                "marketTitle": title,
-                                "price": entry_price,
-                                "side": side_label,
-                                "amount": size,
-                                "token_id": str(token_id),
-                                "event_id": event.get("id"),
-                            }
-                        )
-                    if len(activity) >= limit:
-                        return activity[:limit]
+                if len(activity) >= limit:
+                    return activity[:limit]
         return activity[:limit]
 
     def fetch_public_markets(self, limit: int = 10) -> list[dict[str, Any]]:
