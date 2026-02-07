@@ -23,6 +23,8 @@ class BotStateStorage:
                 "processed_trade_ids": [],
                 "trader_stats": {},
                 "tracked_positions": [],
+                "market_volumes": {},
+                "recent_smart_trades": [],
             }
 
         try:
@@ -34,17 +36,24 @@ class BotStateStorage:
                 "processed_trade_ids": [],
                 "trader_stats": {},
                 "tracked_positions": [],
+                "market_volumes": {},
+                "recent_smart_trades": [],
             }
 
         data.setdefault("processed_trade_ids", [])
         data.setdefault("trader_stats", {})
         data.setdefault("tracked_positions", [])
+        data.setdefault("market_volumes", {})
+        data.setdefault("recent_smart_trades", [])
         return data
 
     def cleanup(self, state: dict[str, Any], max_trades: int = 1000) -> None:
         processed = state.get("processed_trade_ids", [])
         if isinstance(processed, list) and len(processed) > max_trades:
             state["processed_trade_ids"] = processed[-max_trades:]
+        recent = state.get("recent_smart_trades", [])
+        if isinstance(recent, list) and len(recent) > max_trades:
+            state["recent_smart_trades"] = recent[-max_trades:]
 
     def save(self, state: dict[str, Any]) -> None:
         try:

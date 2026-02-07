@@ -79,3 +79,53 @@ class TradeAnalyzer:
                 logger.debug("Failed to parse price/size for trade value: %s", trade)
 
         return 0.0
+
+
+def track_market_volumes(
+    markets: list[dict[str, Any]],
+    previous_volumes: dict[str, float],
+    min_volume: float = 1000,
+    spike_threshold: float = 0.10,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Detect volume spikes based on 24h volume changes."""
+    spikes = []
+    updated_volumes: dict[str, float] = {}
+
+    for market in markets:
+        market_id = str(market.get("conditionId") or market.get("id") or "")
+        if not market_id:
+            continue
+        volume = _extract_volume_24h(market)
+        if volume is None:
+            continue
+        updated_volumes[market_id] = volume
+        previous = previous_volumes.get(market_id)
+        if previous is None or previous <= 0:
+            continue
+        change = (volume - previous) / previous
+        if volume >= min_volume and change >= spike_threshold:
+            spikes.append(
+                {
+                    "market_id": market_id,
+                    "volume": volume,
+                    "previous_volume": previous,
+                    "change_pct": change * 100,
+                    "title": market.get("question")
+                    or market.get("title")
+                    or market.get("name")
+                    or "Unknown",
+                    "url": market.get("url") or market.get("marketUrl"),
+                }
+            )
+
+    return spikes, updated_volumes
+
+
+def _extract_volume_24h(market: dict[str, Any]) -> float | None:
+    for key in ("volume24h", "volume", "volumeUSD", "volume_usd"):
+        if key in market:
+            try:
+                return float(market[key])
+            except (TypeError, ValueError):
+                return None
+    return None

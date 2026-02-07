@@ -6,7 +6,7 @@ import logging
 import time
 from collections import deque
 
-from src.analyzer import TradeAnalyzer
+from src.analyzer import TradeAnalyzer, track_market_volumes
 from src.notifications import TelegramNotifier
 from src.polymarket_api import PolyClient
 from src.storage import BotStateStorage
@@ -26,6 +26,7 @@ def format_trade_message(
     impact: float | None = None,
     reputation: str | None = None,
     critical: bool = False,
+    sentiment: str | None = None,
 ) -> str:
     value = trade.get("estimated_usd_value")
     trader = (
@@ -40,6 +41,7 @@ def format_trade_message(
     title = market_title or "Unknown"
     reputation_label = reputation or "New"
     header = "🔴 CRITICAL ALERT" if critical else "🚨 Smart Trade Detected!"
+    sentiment_label = sentiment or "Neutral"
 
     return (
         f"{header}\n\n"
@@ -47,6 +49,7 @@ def format_trade_message(
         f"💰 Amount: ${value if value is not None else 'N/A'}\n\n"
         f"📈 Price: {price}\n\n"
         f"🧠 Reputation: {reputation_label}\n\n"
+        f"🌡️ Sentiment: {sentiment_label}\n\n"
         f"👤 Trader: {trader}\n\n"
         f"🔗 Link: {link}"
     )
@@ -141,11 +144,70 @@ def format_profit_message(
     )
 
 
+def format_volume_spike_message(spike: dict) -> str:
+    return (
+        "🚀 VOLUME SPIKE\n\n"
+        f"🎯 Market: {spike.get('title', 'Unknown')}\n\n"
+        f"💰 Volume: ${spike.get('volume', 0):,.0f}\n\n"
+        f"📈 Change: {spike.get('change_pct', 0):.2f}%\n\n"
+        f"🔗 Link: {spike.get('url') or 'N/A'}"
+    )
+
+
+def extract_trade_side(trade: dict) -> str | None:
+    for key in ("side", "outcome", "direction", "position"):
+        if key in trade:
+            return str(trade[key]).upper()
+    return None
+
+
+def update_recent_smart_trades(state: dict, trade: dict) -> None:
+    side = extract_trade_side(trade)
+    if side not in {"YES", "NO"}:
+        return
+    recent = state.get("recent_smart_trades", [])
+    recent.append({"timestamp": time.time(), "side": side})
+    state["recent_smart_trades"] = recent
+
+
+def get_sentiment(state: dict) -> str:
+    recent = state.get("recent_smart_trades", [])
+    cutoff = time.time() - 3600
+    yes_count = 0
+    no_count = 0
+    filtered = []
+    for entry in recent:
+        timestamp = entry.get("timestamp", 0)
+        if timestamp >= cutoff:
+            filtered.append(entry)
+            side = entry.get("side")
+            if side == "YES":
+                yes_count += 1
+            elif side == "NO":
+                no_count += 1
+    state["recent_smart_trades"] = filtered
+    if yes_count > no_count and yes_count > 0:
+        return "Bullish 🐂"
+    if no_count > yes_count and no_count > 0:
+        return "Bearish 🐻"
+    return "Neutral"
+
+
 def update_tracked_positions(
     client: PolyClient,
     notifier: TelegramNotifier,
     state: dict,
 ) -> None:
+    markets = client.fetch_markets()
+    previous_volumes = state.get("market_volumes", {})
+    if markets:
+        spikes, updated_volumes = track_market_volumes(markets, previous_volumes)
+        state["market_volumes"] = updated_volumes
+        for spike in spikes:
+            notifier.send_message(format_volume_spike_message(spike))
+    else:
+        logger.warning("No market summaries returned for volume spike detection.")
+
     tracked_positions = state.get("tracked_positions", [])
     if not tracked_positions:
         return
@@ -254,12 +316,14 @@ def process_trades(
                 is_high_impact,
                 trade,
             )
+            update_recent_smart_trades(state, trade)
             message = format_trade_message(
                 trade,
                 market_title=market_title,
                 impact=impact,
                 reputation=reputation,
                 critical=critical,
+                sentiment=get_sentiment(state),
             )
             notifier.send_message(message)
             add_tracked_position(
