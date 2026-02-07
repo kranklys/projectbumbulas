@@ -24,6 +24,16 @@ from src.config import (
 
 logger = logging.getLogger(__name__)
 
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+RETRY_WAIT_S = 15
+
 
 class PolyClient:
     """Minimal client for fetching public data from Polymarket CLOB."""
@@ -51,13 +61,28 @@ class PolyClient:
         if not self.has_credentials:
             logger.info("Please fill in your credentials in the .env file.")
         try:
-            response = self.session.get(url, params=params, timeout=self.timeout_s)
+            response = self.session.get(
+                url,
+                params=params,
+                timeout=self.timeout_s,
+                headers=REQUEST_HEADERS,
+            )
             if response.status_code == 401:
                 logger.error("API Key Required: received 401 Unauthorized from %s", url)
                 if allow_fallback and self.public_base_url:
                     fallback_url = url.replace(self.clob_base_url, self.public_base_url)
                     if fallback_url != url:
                         return self._get(fallback_url, params=params, allow_fallback=False)
+                logger.warning("Status %s from %s. Retrying in %ss.", response.status_code, url, RETRY_WAIT_S)
+                time.sleep(RETRY_WAIT_S)
+                return None
+            if response.status_code == 403:
+                logger.warning("Status %s from %s. Retrying in %ss.", response.status_code, url, RETRY_WAIT_S)
+                time.sleep(RETRY_WAIT_S)
+                return None
+            if response.status_code == 404:
+                logger.warning("Status %s from %s. Retrying in %ss.", response.status_code, url, RETRY_WAIT_S)
+                time.sleep(RETRY_WAIT_S)
                 return None
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
@@ -88,7 +113,8 @@ class PolyClient:
 
         payload = self._get(url, params=params)
         if payload is None:
-            return []
+            logger.warning("Primary trades endpoint failed. Falling back to public markets.")
+            return self.fetch_public_markets(limit=10)
 
         if isinstance(payload, dict) and "trades" in payload:
             return payload["trades"]
@@ -96,6 +122,20 @@ class PolyClient:
             return payload
 
         logger.warning("Unexpected trades response format: %s", type(payload))
+        return self.fetch_public_markets(limit=10)
+
+    def fetch_public_markets(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Fallback: fetch public markets when trades are unavailable."""
+        url = f"{self.public_base_url}{MARKETS_ENDPOINT}"
+        params = {"active": "true", "limit": limit}
+        payload = self._get(url, params=params, allow_fallback=False)
+        if payload is None:
+            return []
+        if isinstance(payload, dict) and "markets" in payload:
+            return payload["markets"]
+        if isinstance(payload, list):
+            return payload
+        logger.warning("Unexpected public markets response format: %s", type(payload))
         return []
 
     def get_market_details(self, condition_id: str) -> dict[str, Any]:
