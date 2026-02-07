@@ -10,8 +10,12 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=20"
-CLOB_PRICE_URL = "https://clob.polymarket.com/price?token_id={token_id}&side=buy"
+GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
+GAMMA_EVENTS_URL = f"{GAMMA_BASE_URL}/events?active=true&closed=false&limit=20"
+GAMMA_MARKETS_URL = f"{GAMMA_BASE_URL}/markets"
+CLOB_BASE_URL = "https://clob.polymarket.com"
+CLOB_PRICE_URL = f"{CLOB_BASE_URL}/price?token_id={{token_id}}&side=buy"
+CLOB_BOOK_URL = f"{CLOB_BASE_URL}/book?token_id={{token_id}}"
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
@@ -21,11 +25,21 @@ class PolyClient:
     def __init__(self) -> None:
         self.session = requests.Session()
 
+    def _get_json(self, url: str, params: dict[str, Any] | None = None) -> Any | None:
+        try:
+            response = self.session.get(url, params=params, headers=REQUEST_HEADERS)
+            if response.status_code != 200:
+                return None
+            return response.json()
+        except requests.RequestException:
+            return None
+        except ValueError:
+            return None
+
     def fetch_markets(self) -> list[dict[str, Any]]:
         """Fetch market data using Gamma events + CLOB price."""
         valid_markets: list[dict[str, Any]] = []
-        resp = self.session.get(GAMMA_EVENTS_URL, headers=REQUEST_HEADERS)
-        events = resp.json()
+        events = self._get_json(GAMMA_EVENTS_URL) or []
         for event in events:
             for market in event.get("markets", []):
                 raw_tokens = market.get("clobTokenIds", [])
@@ -55,6 +69,32 @@ class PolyClient:
             logger.info("✅ PolyClient Rebuilt for Bumbulas")
         return valid_markets
 
+    def fetch_active_events(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Fetch active events from Gamma."""
+        params = {"active": "true", "closed": "false", "limit": limit}
+        payload = self._get_json(f"{GAMMA_BASE_URL}/events", params=params)
+        if isinstance(payload, list):
+            return payload
+        return []
+
+    def fetch_token_price(self, token_id: str) -> dict[str, Any]:
+        """Fetch latest token price from the CLOB API."""
+        url = f"{CLOB_BASE_URL}/price"
+        params = {"token_id": token_id, "side": "buy"}
+        payload = self._get_json(url, params=params)
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def fetch_orderbook(self, token_id: str) -> dict[str, Any]:
+        """Fetch orderbook depth from the CLOB API."""
+        url = f"{CLOB_BASE_URL}/book"
+        params = {"token_id": token_id}
+        payload = self._get_json(url, params=params)
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
     def get_market_data(self) -> list[dict[str, Any]]:
         """Return analyzer-ready market data from Gamma + CLOB."""
         return self.fetch_markets()
@@ -74,6 +114,23 @@ class PolyClient:
                 }
             )
         return trades
+
+    def get_market_details(self, condition_id: str) -> dict[str, Any]:
+        """Fetch market details by condition ID."""
+        payload = self._get_json(f"{GAMMA_MARKETS_URL}/{condition_id}")
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def fetch_historical_data(self, market_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        """Fetch market details for a given market/condition ID."""
+        params = {"limit": limit, "id": market_id}
+        payload = self._get_json(GAMMA_MARKETS_URL, params=params)
+        if isinstance(payload, dict) and "markets" in payload:
+            return payload["markets"]
+        if isinstance(payload, list):
+            return payload
+        return []
 
 
 PolymarketAPI = PolyClient
