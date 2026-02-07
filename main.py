@@ -70,6 +70,35 @@ DISCOVERY_WINDOW_S = 24 * 60 * 60
 DISCOVERY_SCORE_THRESHOLD = 70
 DISCOVERY_MIN_TRADES = 4
 SIGNAL_HISTORY_RETENTION_DAYS = 14
+VIRTUAL_TRADES_PATH = os.path.join("data", "virtual_trades.json")
+VIRTUAL_TRADE_MIN_AGE_S = 60 * 60
+VIRTUAL_TRADE_CHECK_INTERVAL_S = 30 * 60
+PERFORMANCE_REPORT_INTERVAL_S = 60 * 60
+
+REASON_KEY_MAP = {
+    "Very large trade size": "trade_size_very_large",
+    "Large trade size": "trade_size_large",
+    "Notable trade size": "trade_size_notable",
+    "High price impact": "impact_high",
+    "Moderate price impact": "impact_moderate",
+    "Elite trader frequency": "reputation_elite",
+    "Frequent trader activity": "reputation_frequent",
+    "Watchlist whale priority": "watchlist_priority",
+    "Elite smart wallet profile": "profile_elite",
+    "Strong win rate history": "profile_winrate_strong",
+    "Positive win rate history": "profile_winrate_positive",
+    "Positive average outcome": "profile_avg_profit",
+    "Consistent outcomes": "profile_consistent",
+    "Short-term market trend up": "trend_up",
+    "Short-term market trend down": "trend_down",
+    "Bullish smart wallet sentiment": "sentiment_bullish",
+    "Bearish smart wallet sentiment": "sentiment_bearish",
+    "Repeat offender watchlist activity": "repeat_offender",
+    "Crowd momentum in market": "market_momentum",
+    "High market liquidity": "liquidity_high",
+    "Moderate market liquidity": "liquidity_medium",
+    "Low market liquidity": "liquidity_low",
+}
 
 COLOR_MOMENTUM = "\033[95m"
 COLOR_WHALE = "\033[94m"
@@ -639,6 +668,145 @@ def save_signal_history(history: list[dict], path: str = SIGNAL_HISTORY_PATH) ->
         json.dump(history, handle, indent=2, sort_keys=True)
 
 
+def load_virtual_trades(path: str = VIRTUAL_TRADES_PATH) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Failed to load virtual trades from %s", path)
+        return []
+    if isinstance(data, list):
+        return [entry for entry in data if isinstance(entry, dict)]
+    return []
+
+
+def save_virtual_trades(trades: list[dict], path: str = VIRTUAL_TRADES_PATH) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(trades, handle, indent=2, sort_keys=True)
+
+
+def update_reason_weights(state: dict, reasons: list[str], won: bool) -> None:
+    weights = state.get("reason_weights", {})
+    for reason in reasons:
+        key = REASON_KEY_MAP.get(reason)
+        if not key:
+            continue
+        current = float(weights.get(key, 1.0))
+        if won:
+            weights[key] = min(1.5, current + 0.02)
+        else:
+            weights[key] = max(0.5, current - 0.05)
+    state["reason_weights"] = weights
+
+
+def update_wallet_performance(state: dict, trader_key: str, profit: float, won: bool) -> None:
+    performance = state.get("wallet_performance", {})
+    entry = performance.get(trader_key, {"profit": 0.0, "wins": 0, "losses": 0})
+    entry["profit"] = float(entry.get("profit", 0.0)) + float(profit)
+    if won:
+        entry["wins"] = int(entry.get("wins", 0)) + 1
+    else:
+        entry["losses"] = int(entry.get("losses", 0)) + 1
+    performance[trader_key] = entry
+    state["wallet_performance"] = performance
+
+
+def verify_virtual_trades(
+    client: PolyClient,
+    state: dict,
+    virtual_trades: list[dict],
+) -> list[dict]:
+    now = time.time()
+    remaining: list[dict] = []
+    for trade in virtual_trades:
+        entry_time = float(trade.get("timestamp", 0))
+        if now - entry_time < VIRTUAL_TRADE_MIN_AGE_S:
+            remaining.append(trade)
+            continue
+        market_id = trade.get("market_id")
+        entry_price = trade.get("entry_price")
+        if market_id is None or entry_price is None:
+            continue
+        try:
+            entry_price = float(entry_price)
+        except (TypeError, ValueError):
+            continue
+        try:
+            market_details = client.get_market_details(str(market_id))
+            current_price = get_current_market_price(market_details)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Virtual trade check failed for %s: %s", market_id, exc)
+            remaining.append(trade)
+            continue
+        if current_price is None:
+            remaining.append(trade)
+            continue
+        side = trade.get("side")
+        if side == "NO":
+            roi = (entry_price - current_price) / entry_price
+        else:
+            roi = (current_price - entry_price) / entry_price
+        won = roi > 0
+        trader_key = str(trade.get("trader", "unknown")).lower()
+        state.setdefault("wallet_reliability", {})
+        reliability = state["wallet_reliability"].get(trader_key, 0.0)
+        reliability += 1.0 if won else -1.0
+        state["wallet_reliability"][trader_key] = reliability
+        totals = state.get("performance_totals", {"predictions": 0, "wins": 0})
+        totals["predictions"] = int(totals.get("predictions", 0)) + 1
+        if won:
+            totals["wins"] = int(totals.get("wins", 0)) + 1
+        state["performance_totals"] = totals
+        update_wallet_performance(state, trader_key, roi, won)
+        update_reason_weights(state, trade.get("reasons", []), won)
+    return remaining
+
+
+def add_virtual_trade(
+    virtual_trades: list[dict],
+    trade: dict,
+    market_id: str,
+    entry_price: float,
+    reasons: list[str],
+    side: str | None,
+) -> None:
+    virtual_trades.append(
+        {
+            "timestamp": time.time(),
+            "market_id": market_id,
+            "entry_price": entry_price,
+            "trader": trade.get("trader")
+            or trade.get("taker")
+            or trade.get("maker")
+            or trade.get("wallet"),
+            "reasons": reasons,
+            "side": side,
+        }
+    )
+
+
+def log_performance_report(state: dict, total_predictions: int, wins: int) -> None:
+    accuracy = (wins / total_predictions) * 100 if total_predictions else 0.0
+    performance = state.get("wallet_performance", {})
+    top_wallets = sorted(
+        performance.items(),
+        key=lambda item: item[1].get("profit", 0.0),
+        reverse=True,
+    )[:3]
+    top_summary = ", ".join(
+        f"{wallet[:6]}… profit:{data.get('profit', 0.0):.2f}"
+        for wallet, data in top_wallets
+    ) or "N/A"
+    logger.info(
+        "Bot Performance Report | Total Predictions: %s | Accuracy: %.2f%% | Top Wallets: %s",
+        total_predictions,
+        accuracy,
+        top_summary,
+    )
+
 def prune_signal_history(history: list[dict]) -> list[dict]:
     cutoff = time.time() - SIGNAL_HISTORY_RETENTION_DAYS * 24 * 60 * 60
     return [entry for entry in history if entry.get("timestamp", 0) >= cutoff]
@@ -988,6 +1156,7 @@ def process_trades(
     history_manager: HistoryManager,
     discovered_watchlist: set[str],
     signal_history: list[dict],
+    virtual_trades: list[dict],
 ) -> dict:
     stats: dict[str, object] = {
         "fetched_trades": len(trades),
@@ -1111,6 +1280,7 @@ def process_trades(
                 repeat_offender_bonus=REPEAT_OFFENDER_BONUS,
                 market_tracker=analyzer.market_tracker,
                 market_id=market_id,
+                reason_weights=state.get("reason_weights"),
             )
             update_discovery_watchlist(
                 state,
@@ -1126,6 +1296,15 @@ def process_trades(
                     market_title=market_title,
                     market_url=market_url,
                 )
+                if entry_price is not None and condition_id:
+                    add_virtual_trade(
+                        virtual_trades,
+                        trade,
+                        str(condition_id),
+                        entry_price,
+                        reasons,
+                        extract_trade_side(trade),
+                    )
             history_manager.add_trade(market_id, trade_id, score)
             momentum_alert = history_manager.detect_momentum(
                 market_id,
@@ -1295,10 +1474,13 @@ def main() -> None:
     trader_history = load_trader_history()
     discovered_watchlist = load_discovered_whales()
     signal_history = load_signal_history()
+    virtual_trades = load_virtual_trades()
     history_manager = HistoryManager(retention_seconds=CLEANUP_RETENTION_S)
     dashboard = Dashboard()
     logger.info("Starting Polymarket Smart Money tracker loop.")
     cycle = 0
+    last_virtual_check = 0.0
+    last_performance_report = 0.0
 
     dashboard.start()
     try:
@@ -1331,6 +1513,7 @@ def main() -> None:
                     history_manager,
                     discovered_watchlist,
                     signal_history,
+                    virtual_trades,
                 )
                 stats["cycle"] = cycle
                 if cycle % 10 == 0:
@@ -1343,6 +1526,7 @@ def main() -> None:
                 save_trader_history(trader_history)
                 signal_history = prune_signal_history(signal_history)
                 save_signal_history(signal_history)
+                save_virtual_trades(virtual_trades)
 
             report_date = _format_date_label(time.time())
             last_report_date = state.get("last_daily_report_date")
@@ -1354,6 +1538,21 @@ def main() -> None:
                     report_paths.get("summary"),
                     report_paths.get("html"),
                 )
+
+            now = time.time()
+            if now - last_virtual_check >= VIRTUAL_TRADE_CHECK_INTERVAL_S:
+                virtual_trades = verify_virtual_trades(client, state, virtual_trades)
+                save_virtual_trades(virtual_trades)
+                last_virtual_check = now
+
+            if now - last_performance_report >= PERFORMANCE_REPORT_INTERVAL_S:
+                totals = state.get("performance_totals", {"predictions": 0, "wins": 0})
+                log_performance_report(
+                    state,
+                    int(totals.get("predictions", 0)),
+                    int(totals.get("wins", 0)),
+                )
+                last_performance_report = now
 
             cleanup_state_memory(state, history_manager)
             dashboard.update(stats, state)
