@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 
 
-BASE_API_URL = os.getenv("POLYMARKET_CLOB_API", "https://clob.polymarket.com")
+PUBLIC_API_URL = os.getenv("POLYMARKET_PUBLIC_API", "https://gamma-api.polymarket.com")
+CLOB_API_URL = os.getenv("POLYMARKET_CLOB_API", "https://clob.polymarket.com")
+BASE_API_URL = os.getenv("POLYMARKET_API", PUBLIC_API_URL)
 TRADES_ENDPOINT = "/trades"
 MARKETS_ENDPOINT = "/markets"
 DEFAULT_TIMEOUT_S = 10

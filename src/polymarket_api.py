@@ -11,9 +11,11 @@ import requests
 
 from src.config import (
     BASE_API_URL,
+    CLOB_API_URL,
     DEFAULT_TIMEOUT_S,
     DEFAULT_TRADE_LIMIT,
     MARKETS_ENDPOINT,
+    PUBLIC_API_URL,
     RATE_LIMIT_BACKOFF_S,
     TRADES_ENDPOINT,
 )
@@ -26,12 +28,26 @@ class PolyClient:
 
     def __init__(self, base_url: str | None = None, timeout_s: int | None = None) -> None:
         self.base_url = base_url or BASE_API_URL
+        self.public_base_url = PUBLIC_API_URL
+        self.clob_base_url = CLOB_API_URL
         self.timeout_s = timeout_s or DEFAULT_TIMEOUT_S
         self.session = requests.Session()
 
-    def _get(self, url: str, params: dict[str, Any] | None = None) -> dict | list | None:
+    def _get(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        allow_fallback: bool = True,
+    ) -> dict | list | None:
         try:
             response = self.session.get(url, params=params, timeout=self.timeout_s)
+            if response.status_code == 401:
+                logger.error("API Key Required: received 401 Unauthorized from %s", url)
+                if allow_fallback and self.public_base_url:
+                    fallback_url = url.replace(self.clob_base_url, self.public_base_url)
+                    if fallback_url != url:
+                        return self._get(fallback_url, params=params, allow_fallback=False)
+                return None
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
                 sleep_for = RATE_LIMIT_BACKOFF_S
