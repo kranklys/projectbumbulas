@@ -49,3 +49,26 @@ class PolyClient:
 
         logger.warning("Unexpected trades response format: %s", type(payload))
         return []
+
+    def get_market_details(self, condition_id: str) -> dict[str, Any]:
+        """Fetch market details by condition ID."""
+        url = f"{self.base_url}/markets/{condition_id}"
+
+        logger.info("Fetching market details from %s", url)
+
+        try:
+            response = requests.get(url, timeout=self.timeout_s)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            logger.exception("Failed to fetch market details: %s", exc)
+            return {}
+        except ValueError as exc:
+            logger.exception("Failed to parse market details: %s", exc)
+            return {}
+
+        if isinstance(payload, dict):
+            return payload
+
+        logger.warning("Unexpected market details format: %s", type(payload))
+        return {}
