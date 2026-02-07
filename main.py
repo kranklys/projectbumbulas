@@ -14,6 +14,7 @@ from src.analyzer import (
     assess_market_risk,
     compute_signal_score,
     evaluate_signal_density,
+    log_high_score_alert,
     track_market_volumes,
 )
 from src.notifications import TelegramNotifier
@@ -26,6 +27,9 @@ from src.config import (
     POLL_INTERVAL_S,
     SAVE_INTERVAL_CYCLES,
 )
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
 
 
 logging.basicConfig(
@@ -40,6 +44,7 @@ SMART_WALLET_WINDOW_S = 60 * 60
 SMART_WALLET_THRESHOLD = 3
 MOMENTUM_MIN_SCORE = 85
 MOMENTUM_MIN_TRADES = 3
+CLEANUP_RETENTION_S = 24 * 60 * 60
 
 COLOR_MOMENTUM = "\033[95m"
 COLOR_WHALE = "\033[94m"
@@ -224,6 +229,84 @@ def refresh_elite_smart_wallets(state: dict) -> None:
         trader for trader, profile in profiles.items() if profile.get("elite", False)
     ]
     state["elite_smart_wallets"] = elites
+
+
+def normalize_seen_trades(state: dict, now: float) -> list[dict]:
+    seen_entries = state.get("seen_trades")
+    if not seen_entries:
+        legacy_ids = state.get("seen_trade_ids", [])
+        return [
+            {"trade_id": str(trade_id), "timestamp": now} for trade_id in legacy_ids
+        ]
+    normalized = []
+    for entry in seen_entries:
+        if isinstance(entry, dict) and "trade_id" in entry:
+            normalized.append(
+                {
+                    "trade_id": str(entry.get("trade_id")),
+                    "timestamp": float(entry.get("timestamp", now)),
+                }
+            )
+        else:
+            normalized.append({"trade_id": str(entry), "timestamp": now})
+    return normalized
+
+
+def cleanup_state_memory(state: dict, history_manager: HistoryManager) -> None:
+    now = time.time()
+    cutoff = now - CLEANUP_RETENTION_S
+    state["seen_trades"] = [
+        entry
+        for entry in state.get("seen_trades", [])
+        if entry.get("timestamp", 0) >= cutoff
+    ]
+    state.pop("seen_trade_ids", None)
+    history_manager.prune(event_time=now)
+
+
+def build_market_url(trade: dict, market_details: dict | None) -> str | None:
+    return (
+        trade.get("marketUrl")
+        or trade.get("url")
+        or (market_details.get("url") if market_details else None)
+        or (market_details.get("marketUrl") if market_details else None)
+    )
+
+
+class Dashboard:
+    def __init__(self) -> None:
+        self.console = Console()
+        self.live = Live(
+            self._render({}, {}),
+            console=self.console,
+            refresh_per_second=2,
+            transient=False,
+        )
+
+    def start(self) -> None:
+        self.live.start()
+
+    def stop(self) -> None:
+        self.live.stop()
+
+    def update(self, stats: dict, state: dict) -> None:
+        self.live.update(self._render(stats, state), refresh=True)
+
+    def _render(self, stats: dict, state: dict) -> Table:
+        table = Table(title="📊 Polymarket Smart Money Dashboard", expand=True)
+        table.add_column("Metric", style="bold cyan")
+        table.add_column("Value", style="magenta")
+        table.add_row("Cycle", str(stats.get("cycle", "-")))
+        table.add_row("Fetched Trades", str(stats.get("fetched_trades", 0)))
+        table.add_row("Whale Trades", str(stats.get("whale_trades", 0)))
+        table.add_row("Alerts Sent", str(stats.get("alerts_sent", 0)))
+        table.add_row("Elite Wallets", str(len(state.get("elite_smart_wallets", []))))
+        last_score = stats.get("last_score")
+        table.add_row("Last Score", str(last_score) if last_score is not None else "-")
+        table.add_row("Last Market", stats.get("last_market", "-"))
+        table.add_row("Last URL", stats.get("last_url", "-"))
+        table.add_row("Seen Trades (24h)", str(len(state.get("seen_trades", []))))
+        return table
 
 
 def add_tracked_position(
@@ -543,7 +626,15 @@ def process_trades(
     state: dict,
     trader_history: dict,
     history_manager: HistoryManager,
-) -> None:
+) -> dict:
+    stats: dict[str, object] = {
+        "fetched_trades": len(trades),
+        "whale_trades": 0,
+        "alerts_sent": 0,
+        "last_score": None,
+        "last_market": None,
+        "last_url": None,
+    }
     normalized_trades = []
     for index, trade in enumerate(trades):
         if not isinstance(trade, dict):
@@ -553,12 +644,14 @@ def process_trades(
 
     if not normalized_trades:
         logger.warning("No valid trades to process after normalization.")
-        return
+        return stats
 
     analyzer = TradeAnalyzer(normalized_trades)
     whale_trades = analyzer.find_whale_trades()
-    seen_trade_ids = deque(state.get("seen_trade_ids", []), maxlen=2000)
-    seen_trade_id_set = set(seen_trade_ids)
+    stats["whale_trades"] = len(whale_trades)
+    now = time.time()
+    seen_trades = deque(normalize_seen_trades(state, now), maxlen=2000)
+    seen_trade_id_set = {entry.get("trade_id") for entry in seen_trades}
     trader_stats = state.get("trader_stats", {})
     trader_profiles = state.get("trader_profiles", {})
 
@@ -606,6 +699,9 @@ def process_trades(
                 min_volume=MIN_MARKET_VOLUME,
                 max_spread_pct=MAX_SPREAD_PCT,
             )
+            market_url = build_market_url(trade, market_details)
+            if market_url:
+                trade["marketUrl"] = market_url
             entry_price = trade.get("price")
             if entry_price is not None:
                 try:
@@ -637,6 +733,14 @@ def process_trades(
                 market_tracker=analyzer.market_tracker,
                 market_id=market_id,
             )
+            if score > 80:
+                log_high_score_alert(
+                    trade,
+                    score,
+                    reasons,
+                    market_title=market_title,
+                    market_url=market_url,
+                )
             history_manager.add_trade(market_id, trade_id, score)
             momentum_alert = history_manager.detect_momentum(
                 market_id,
@@ -656,7 +760,7 @@ def process_trades(
                     "last_seen": time.time(),
                     "watchlist": is_watchlisted,
                 }
-                seen_trade_ids.append(trade_id)
+                seen_trades.append({"trade_id": trade_id, "timestamp": time.time()})
                 seen_trade_id_set.add(trade_id)
                 continue
             log_signal_event(
@@ -687,6 +791,10 @@ def process_trades(
             if momentum_alert:
                 message = f"🚀 MOMENTUM ALERT\n\n{message}"
             notifier.send_message(message)
+            stats["alerts_sent"] = int(stats.get("alerts_sent", 0)) + 1
+            stats["last_score"] = score
+            stats["last_market"] = market_title or "Unknown"
+            stats["last_url"] = market_url or "N/A"
             trader_history[trader_key] = {
                 "count": history_entry.get("count", 0) + 1,
                 "last_seen": time.time(),
@@ -709,13 +817,14 @@ def process_trades(
                 trade.get("estimated_usd_value"),
             )
 
-        seen_trade_ids.append(trade_id)
+        seen_trades.append({"trade_id": trade_id, "timestamp": time.time()})
         seen_trade_id_set.add(trade_id)
 
-    state["seen_trade_ids"] = list(seen_trade_ids)
+    state["seen_trades"] = list(seen_trades)
     state["trader_stats"] = trader_stats
     state["trader_profiles"] = trader_profiles
     refresh_elite_smart_wallets(state)
+    return stats
 
 
 def log_top_traders(state: dict, limit: int = 5) -> None:
@@ -749,33 +858,42 @@ def main() -> None:
     storage = BotStateStorage()
     state = storage.load()
     trader_history = load_trader_history()
-    history_manager = HistoryManager()
+    history_manager = HistoryManager(retention_seconds=CLEANUP_RETENTION_S)
+    dashboard = Dashboard()
     logger.info("Starting Polymarket Smart Money tracker loop.")
     cycle = 0
 
-    while True:
-        trades = client.fetch_latest_trades()
-        if not trades:
-            logger.warning("No trades returned from API.")
-        else:
-            process_trades(
-                trades,
-                notifier,
-                client,
-                state,
-                trader_history,
-                history_manager,
-            )
-            if cycle % 10 == 0:
-                update_tracked_positions(client, notifier, state)
-                log_top_traders(state)
-            storage.cleanup(state)
-            if cycle % SAVE_INTERVAL_CYCLES == 0:
-                storage.save(state)
-                save_trader_history(trader_history)
+    dashboard.start()
+    try:
+        while True:
+            trades = client.fetch_latest_trades()
+            if not trades:
+                logger.warning("No trades returned from API.")
+                stats = {"cycle": cycle, "fetched_trades": 0}
+            else:
+                stats = process_trades(
+                    trades,
+                    notifier,
+                    client,
+                    state,
+                    trader_history,
+                    history_manager,
+                )
+                stats["cycle"] = cycle
+                if cycle % 10 == 0:
+                    update_tracked_positions(client, notifier, state)
+                    log_top_traders(state)
+                storage.cleanup(state)
+                if cycle % SAVE_INTERVAL_CYCLES == 0:
+                    storage.save(state)
+                    save_trader_history(trader_history)
 
-        time.sleep(POLL_INTERVAL_S)
-        cycle += 1
+            cleanup_state_memory(state, history_manager)
+            dashboard.update(stats, state)
+            time.sleep(POLL_INTERVAL_S)
+            cycle += 1
+    finally:
+        dashboard.stop()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -190,6 +191,35 @@ def compute_signal_score(
 
     score = max(0, min(100, score))
     return score, reasons
+
+
+def log_high_score_alert(
+    trade: dict[str, Any],
+    score: int,
+    reasons: list[str],
+    market_title: str | None = None,
+    market_url: str | None = None,
+    file_path: str = "alerts.log",
+) -> None:
+    """Append high-score alert details to a log file."""
+    payload = {
+        "timestamp": time.time(),
+        "trade_id": trade.get("id"),
+        "score": score,
+        "reasons": reasons,
+        "market_title": market_title or "Unknown",
+        "market_url": market_url or trade.get("marketUrl") or trade.get("url"),
+        "trader": trade.get("trader")
+        or trade.get("taker")
+        or trade.get("maker")
+        or trade.get("wallet"),
+        "estimated_usd_value": trade.get("estimated_usd_value"),
+    }
+    try:
+        with open(file_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except OSError:
+        logger.warning("Failed to write high-score alert to %s", file_path)
 
 
 def evaluate_signal_density(
