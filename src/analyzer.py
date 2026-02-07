@@ -100,6 +100,8 @@ def compute_signal_score(
     reputation_count: int,
     impact: float | None,
     trader_profile: dict[str, Any] | None = None,
+    market_trend: str | None = None,
+    market_sentiment: str | None = None,
     repeat_offender: bool = False,
     repeat_offender_bonus: int = 10,
     market_tracker: dict[str, list[float]] | None = None,
@@ -168,6 +170,20 @@ def compute_signal_score(
         if isinstance(profit_volatility, (int, float)) and profit_volatility < 0.05:
             score += 3
             reasons.append("Consistent outcomes")
+
+    if market_trend == "Up":
+        score += 5
+        reasons.append("Short-term market trend up")
+    elif market_trend == "Down":
+        score -= 5
+        reasons.append("Short-term market trend down")
+
+    if market_sentiment == "Bullish":
+        score += 3
+        reasons.append("Bullish smart wallet sentiment")
+    elif market_sentiment == "Bearish":
+        score -= 3
+        reasons.append("Bearish smart wallet sentiment")
 
     if repeat_offender:
         score += repeat_offender_bonus

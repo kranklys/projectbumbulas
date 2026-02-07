@@ -47,6 +47,7 @@ MOMENTUM_MIN_TRADES = 3
 CLEANUP_RETENTION_S = 24 * 60 * 60
 FETCH_RETRY_ATTEMPTS = 3
 FETCH_RETRY_BACKOFF_S = 2
+MARKET_TREND_WINDOW_S = 15 * 60
 
 COLOR_MOMENTUM = "\033[95m"
 COLOR_WHALE = "\033[94m"
@@ -67,6 +68,8 @@ def format_trade_message(
     signal_type: str | None = None,
     signal_density: str | None = None,
     priority_multiplier: int = 1,
+    market_trend: str | None = None,
+    market_regime: str | None = None,
 ) -> str:
     value = trade.get("estimated_usd_value")
     wallet_pnl = (
@@ -95,6 +98,8 @@ def format_trade_message(
     signal_type_label = signal_type or "Standard"
     density_label = signal_density or "N/A"
     priority_label = f"x{priority_multiplier}"
+    trend_label = market_trend or "Unknown"
+    regime_label = market_regime or "Normal"
 
     return (
         f"{header}\n\n"
@@ -104,6 +109,7 @@ def format_trade_message(
         f"📈 Price: {price}\n\n"
         f"🧠 Reputation: {reputation_label}\n\n"
         f"🌡️ Sentiment: {sentiment_label}\n\n"
+        f"📊 Trend: {trend_label} | Regime: {regime_label}\n\n"
         f"✅ Signal Score: {score_label}\n"
         f"🧩 Reasons: {reason_text}\n\n"
         f"⚠️ Risk: {risk_text}\n"
@@ -428,9 +434,48 @@ def get_sentiment(state: dict) -> str:
                 no_count += 1
     state["recent_smart_trades"] = filtered
     if yes_count > no_count and yes_count > 0:
-        return "Bullish 🐂"
+        return "Bullish"
     if no_count > yes_count and no_count > 0:
-        return "Bearish 🐻"
+        return "Bearish"
+    return "Neutral"
+
+
+def update_market_price_history(
+    state: dict, condition_id: str, price: float | None
+) -> None:
+    if price is None:
+        return
+    history = state.get("market_price_history", {})
+    entries = history.get(condition_id, [])
+    entries.append({"timestamp": time.time(), "price": price})
+    cutoff = time.time() - MARKET_TREND_WINDOW_S
+    history[condition_id] = [entry for entry in entries if entry["timestamp"] >= cutoff]
+    state["market_price_history"] = history
+
+
+def get_market_trend(state: dict, condition_id: str) -> str:
+    history = state.get("market_price_history", {}).get(condition_id, [])
+    if len(history) < 2:
+        return "Flat"
+    start = history[0]["price"]
+    end = history[-1]["price"]
+    if start == 0:
+        return "Flat"
+    change_pct = (end - start) / start
+    if change_pct >= 0.01:
+        return "Up"
+    if change_pct <= -0.01:
+        return "Down"
+    return "Flat"
+
+
+def classify_market_regime(risk_label: str, trend: str) -> str:
+    if risk_label == "High":
+        return "Defensive"
+    if trend == "Up":
+        return "Risk-On"
+    if trend == "Down":
+        return "Risk-Off"
     return "Neutral"
 
 
@@ -702,6 +747,11 @@ def process_trades(
                         or market_details.get("title")
                         or market_details.get("name")
                     )
+            current_market_price = (
+                get_current_market_price(market_details) if market_details else None
+            )
+            if condition_id and current_market_price is not None:
+                update_market_price_history(state, str(condition_id), current_market_price)
             history_entry = trader_history.get(trader_key, {})
             repeat_offender = is_watchlisted and history_entry.get("count", 0) > 0
             risk_label, risk_reasons = assess_market_risk(
@@ -709,6 +759,12 @@ def process_trades(
                 min_volume=MIN_MARKET_VOLUME,
                 max_spread_pct=MAX_SPREAD_PCT,
             )
+            market_trend = (
+                get_market_trend(state, str(condition_id))
+                if condition_id
+                else "Flat"
+            )
+            market_regime = classify_market_regime(risk_label, market_trend)
             market_url = build_market_url(trade, market_details)
             if market_url:
                 trade["marketUrl"] = market_url
@@ -732,12 +788,15 @@ def process_trades(
             )
             market_id = str(condition_id) if condition_id else "unknown"
             analyzer.record_whale_trade(market_id)
+            sentiment_label = get_sentiment(state)
             score, reasons = compute_signal_score(
                 trade,
                 market_details,
                 trader_stats[trader_key],
                 impact,
                 trader_profile=profile,
+                market_trend=market_trend,
+                market_sentiment=sentiment_label,
                 repeat_offender=repeat_offender,
                 repeat_offender_bonus=REPEAT_OFFENDER_BONUS,
                 market_tracker=analyzer.market_tracker,
@@ -789,7 +848,7 @@ def process_trades(
                 impact=impact,
                 reputation=reputation,
                 critical=critical,
-                sentiment=get_sentiment(state),
+                sentiment=sentiment_label,
                 signal_score=score,
                 reasons=reasons,
                 risk_label=risk_label,
@@ -797,6 +856,8 @@ def process_trades(
                 signal_type=signal_type,
                 signal_density=signal_density,
                 priority_multiplier=priority_multiplier,
+                market_trend=market_trend,
+                market_regime=market_regime,
             )
             if momentum_alert:
                 message = f"🚀 MOMENTUM ALERT\n\n{message}"
