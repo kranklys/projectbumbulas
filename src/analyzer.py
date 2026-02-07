@@ -19,8 +19,13 @@ WATCHLIST_ADDRESSES = {
 class TradeAnalyzer:
     """Analyze trades for whale activity and watchlisted wallets."""
 
-    def __init__(self, trades: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        trades: list[dict[str, Any]],
+        watchlist: set[str] | None = None,
+    ) -> None:
         self.trades = trades
+        self.watchlist = {addr.lower() for addr in (watchlist or WATCHLIST_ADDRESSES)}
         self.market_tracker: dict[str, list[float]] = {}
 
     def find_whale_trades(
@@ -46,7 +51,7 @@ class TradeAnalyzer:
         )
         if not address:
             return False
-        return str(address).lower() in {addr.lower() for addr in WATCHLIST_ADDRESSES}
+        return str(address).lower() in self.watchlist
 
     def is_high_impact(self, trade: dict[str, Any], threshold: float = 0.02) -> bool:
         """Detect if a single trade moved price by more than threshold."""

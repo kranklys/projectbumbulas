@@ -11,6 +11,7 @@ from collections import deque
 
 from src.analyzer import (
     TradeAnalyzer,
+    WATCHLIST_ADDRESSES,
     assess_market_risk,
     compute_signal_score,
     evaluate_signal_density,
@@ -39,6 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TRADER_HISTORY_PATH = os.path.join("data", "trader_history.json")
+DISCOVERED_WHALES_PATH = os.path.join("data", "discovered_whales.json")
 REPEAT_OFFENDER_BONUS = 10
 SMART_WALLET_WINDOW_S = 60 * 60
 SMART_WALLET_THRESHOLD = 3
@@ -48,6 +50,9 @@ CLEANUP_RETENTION_S = 24 * 60 * 60
 FETCH_RETRY_ATTEMPTS = 3
 FETCH_RETRY_BACKOFF_S = 2
 MARKET_TREND_WINDOW_S = 15 * 60
+DISCOVERY_WINDOW_S = 24 * 60 * 60
+DISCOVERY_SCORE_THRESHOLD = 70
+DISCOVERY_MIN_TRADES = 4
 
 COLOR_MOMENTUM = "\033[95m"
 COLOR_WHALE = "\033[94m"
@@ -275,6 +280,14 @@ def cleanup_state_memory(state: dict, history_manager: HistoryManager) -> None:
         for entry in state.get("seen_trades", [])
         if entry.get("timestamp", 0) >= cutoff
     ]
+    high_score_history = state.get("high_score_history", {})
+    for trader_key, entries in list(high_score_history.items()):
+        filtered = [ts for ts in entries if ts >= now - DISCOVERY_WINDOW_S]
+        if filtered:
+            high_score_history[trader_key] = filtered
+        else:
+            high_score_history.pop(trader_key, None)
+    state["high_score_history"] = high_score_history
     state.pop("seen_trade_ids", None)
     history_manager.prune(event_time=now)
 
@@ -286,6 +299,52 @@ def build_market_url(trade: dict, market_details: dict | None) -> str | None:
         or (market_details.get("url") if market_details else None)
         or (market_details.get("marketUrl") if market_details else None)
     )
+
+
+def load_discovered_whales(path: str = DISCOVERED_WHALES_PATH) -> set[str]:
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Failed to load discovered whales from %s", path)
+        return set()
+    if isinstance(data, list):
+        return {str(entry).lower() for entry in data}
+    return set()
+
+
+def save_discovered_whales(addresses: set[str], path: str = DISCOVERED_WHALES_PATH) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(sorted(addresses), handle, indent=2)
+
+
+def update_discovery_watchlist(
+    state: dict,
+    trader_key: str,
+    score: int,
+    discovered_watchlist: set[str],
+) -> bool:
+    if score <= DISCOVERY_SCORE_THRESHOLD:
+        return False
+    now = time.time()
+    history = state.get("high_score_history", {})
+    timestamps = history.get(trader_key, [])
+    timestamps.append(now)
+    cutoff = now - DISCOVERY_WINDOW_S
+    timestamps = [ts for ts in timestamps if ts >= cutoff]
+    history[trader_key] = timestamps
+    state["high_score_history"] = history
+    if trader_key in discovered_watchlist:
+        return False
+    if len(timestamps) >= DISCOVERY_MIN_TRADES:
+        discovered_watchlist.add(trader_key)
+        save_discovered_whales(discovered_watchlist)
+        logger.info("Added %s to discovered whales list.", trader_key)
+        return True
+    return False
 
 
 class Dashboard:
@@ -548,12 +607,18 @@ def log_signal_event(
     priority_multiplier: int,
     market_title: str | None,
     trader: str,
+    trader_count: int,
     score: int,
     risk_label: str,
     reasons: list[str],
     momentum_alert: str | None = None,
 ) -> None:
     title = market_title or "Unknown"
+    trader_label = (
+        f"Frequent Trader (seen {trader_count}x)"
+        if trader_count > 1
+        else "New Whale"
+    )
     if momentum_alert:
         header = f"{COLOR_MOMENTUM}🚀 MOMENTUM ALERT{COLOR_RESET}"
     elif signal_type == "CONFIRMED MOMENTUM":
@@ -569,7 +634,7 @@ def log_signal_event(
         "\n%s\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🎯 Market: %s\n"
-        "👤 Trader: %s\n"
+        "👤 Trader: %s | %s\n"
         "✅ Score: %s/100 | Priority: x%s\n"
         "⚠️ Risk: %s\n"
         "🧩 Reasons: %s\n"
@@ -577,6 +642,7 @@ def log_signal_event(
         header,
         title,
         trader,
+        trader_label,
         score,
         priority_multiplier,
         risk_label,
@@ -680,6 +746,7 @@ def process_trades(
     state: dict,
     trader_history: dict,
     history_manager: HistoryManager,
+    discovered_watchlist: set[str],
 ) -> dict:
     stats: dict[str, object] = {
         "fetched_trades": len(trades),
@@ -700,7 +767,9 @@ def process_trades(
         logger.warning("No valid trades to process after normalization.")
         return stats
 
-    analyzer = TradeAnalyzer(normalized_trades)
+    analyzer = TradeAnalyzer(
+        normalized_trades, watchlist=set(WATCHLIST_ADDRESSES) | discovered_watchlist
+    )
     whale_trades = analyzer.find_whale_trades()
     stats["whale_trades"] = len(whale_trades)
     now = time.time()
@@ -802,6 +871,12 @@ def process_trades(
                 market_tracker=analyzer.market_tracker,
                 market_id=market_id,
             )
+            update_discovery_watchlist(
+                state,
+                trader_key,
+                score,
+                discovered_watchlist,
+            )
             if score > 80:
                 log_high_score_alert(
                     trade,
@@ -837,6 +912,7 @@ def process_trades(
                 priority_multiplier,
                 market_title,
                 trader_key,
+                trader_stats[trader_key],
                 score,
                 risk_label,
                 reasons,
@@ -929,6 +1005,7 @@ def main() -> None:
     storage = BotStateStorage()
     state = storage.load()
     trader_history = load_trader_history()
+    discovered_watchlist = load_discovered_whales()
     history_manager = HistoryManager(retention_seconds=CLEANUP_RETENTION_S)
     dashboard = Dashboard()
     logger.info("Starting Polymarket Smart Money tracker loop.")
@@ -963,6 +1040,7 @@ def main() -> None:
                     state,
                     trader_history,
                     history_manager,
+                    discovered_watchlist,
                 )
                 stats["cycle"] = cycle
                 if cycle % 10 == 0:
