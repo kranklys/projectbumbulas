@@ -8,7 +8,7 @@ import logging
 import os
 import statistics
 import time
-from collections import Counter, deque
+from collections import Counter
 from datetime import datetime, timezone
 
 from src.analyzer import (
@@ -192,22 +192,20 @@ def estimate_price_impact(trade: dict) -> float | None:
 
 def _format_trade_feed_entry(
     trade: dict,
-    amount: float,
+    size: float,
     side: str | None,
-    reasoning: list[str] | None,
 ) -> str:
     market_name = _extract_market_name(trade)
-    price = trade.get("price") or "N/A"
+    price = trade.get("price")
     side_label = side or "N/A"
     if side_label.upper() == "BUY":
         side_label = "[green]BUY[/green]"
     elif side_label.upper() == "SELL":
         side_label = "[red]SELL[/red]"
-    reasoning_text = "; ".join(reasoning or [])
-    insight = f" | Insight: {reasoning_text}" if reasoning_text else ""
+    price_text = f"{price:.4f}" if isinstance(price, (int, float)) else "N/A"
     return (
-        f"[TRADE] Market: {market_name} | Side: {side_label} | "
-        f"Amount: ${amount:,.2f} | Price: {price}{insight}"
+        f"[WHALE ALERT] {market_name} | Size: {size:,.2f} | "
+        f"Side: {side_label} | Price: {price_text}"
     )
 
 
@@ -1293,297 +1291,50 @@ def process_trades(
         fetched_trades.append(normalize_trade(trade, index))
     stats["fetched_trades"] = len(fetched_trades)
 
-    now = time.time()
-    seen_trades = deque(normalize_seen_trades(state, now), maxlen=2000)
-    seen_trade_id_set = {entry.get("trade_id") for entry in seen_trades}
+    processed_order_ids = set(state.get("processed_order_ids", []))
     analyzer = TradeAnalyzer(
         fetched_trades, watchlist=set(WATCHLIST_ADDRESSES) | discovered_watchlist
     )
-    new_trades, new_trade_ids = analyzer.filter_new_trades(seen_trade_id_set)
-    stats["new_trades"] = len(new_trades)
-    same_batch_message = None
-    if not new_trades:
-        logger.warning("No new trades to process after deduplication.")
-        if fetched_trades:
-            same_batch_message = "API returned the same batch, no new trades."
-            logger.info(same_batch_message)
-    for trade_id in new_trade_ids:
-        seen_trades.append({"trade_id": trade_id, "timestamp": now})
-
-    trader_stats = state.get("trader_stats", {})
-    trader_profiles = state.get("trader_profiles", {})
-
-    market_trade_counts = Counter(_extract_market_name(trade) for trade in fetched_trades)
-    feed_entries = []
-    if same_batch_message:
-        feed_entries.append(same_batch_message)
-    min_trade_usd = 50.0
-    recent_flows = list(state.get("recent_reputable_flows", []))
-    for trade in fetched_trades:
-        amount = analyzer.estimate_trade_value_usd(trade)
+    whale_alerts: list[str] = []
+    bid_volumes: dict[str, float] = {}
+    whale_threshold = 100.0
+    for index, trade in enumerate(fetched_trades):
         side = extract_trade_side(trade)
-        market_name = _extract_market_name(trade)
-        if amount >= min_trade_usd:
-            reasoning = _build_reasoning(trade, amount, side, market_trade_counts)
-            logger.info(
-                "[ANALYSIS] %s | Market: %s | Amount: $%.2f",
-                "; ".join(reasoning),
-                market_name,
-                amount,
+        order_id = str(
+            trade.get("id") or trade.get("order_key") or get_trade_id(trade, index)
+        )
+        trade.setdefault("id", order_id)
+        if order_id in processed_order_ids:
+            continue
+        size = trade.get("size") or trade.get("amount") or trade.get("order_size") or 0.0
+        price = trade.get("price")
+        try:
+            size_value = float(size)
+        except (TypeError, ValueError):
+            size_value = 0.0
+        if isinstance(price, (int, float)) and side and side.upper() == "BUY":
+            market_name = _extract_market_name(trade)
+            bid_volumes[market_name] = bid_volumes.get(market_name, 0.0) + (
+                float(price) * size_value
             )
-            if _is_reputable_trade(trade, analyzer, trader_stats, trader_profiles):
-                recent_flows.append(
-                    {
-                        "timestamp": now,
-                        "market": market_name,
-                        "amount": amount,
-                    }
+        notional = trade.get("notional")
+        if notional is None:
+            notional = analyzer.estimate_trade_value_usd(trade)
+        if notional >= whale_threshold:
+            processed_order_ids.add(order_id)
+            stats["new_trades"] = int(stats.get("new_trades", 0)) + 1
+            if len(whale_alerts) < 10:
+                whale_alerts.append(
+                    _format_trade_feed_entry(trade, size_value, side)
                 )
-        else:
-            reasoning = None
-        if len(feed_entries) < 10:
-            if amount < min_trade_usd:
-                feed_entries.append(f"[SKIP] Small trade of ${amount:,.2f}")
-            else:
-                feed_entries.append(
-                    _format_trade_feed_entry(trade, amount, side, reasoning)
-                )
-    stats["trade_feed"] = feed_entries
-    state["recent_reputable_flows"] = recent_flows[-200:]
-    top_market, top_amount = _select_top_opportunity(state["recent_reputable_flows"])
-    stats["top_opportunity_market"] = top_market
-    stats["top_opportunity_amount"] = top_amount
-    five_min_cutoff = now - 5 * 60
-    recent_window = [
-        entry
-        for entry in state["recent_reputable_flows"]
-        if entry.get("timestamp", 0) >= five_min_cutoff
-    ]
-    if recent_window:
-        window_top, window_amount = _select_top_opportunity(recent_window)
-        if window_top:
-            logger.info(
-                "I recommend watching %s because $%.2f amount of money flowed in during the last 5 minutes.",
-                window_top,
-                window_amount,
-            )
 
-    whale_trades = analyzer.find_whale_trades(new_trades)
-    stats["whale_trades"] = len(whale_trades)
-
-    for index, trade in enumerate(whale_trades):
-        trade_id = str(trade.get("id") or get_trade_id(trade, index))
-
-        is_watchlisted = analyzer.is_watchlist_trade(trade)
-        is_high_impact = analyzer.is_high_impact(trade)
-        impact = estimate_price_impact(trade)
-        trade["is_watchlisted"] = is_watchlisted
-
-        if is_watchlisted or is_high_impact:
-            trader = (
-                trade.get("trader")
-                or trade.get("taker")
-                or trade.get("maker")
-                or trade.get("wallet")
-                or "Unknown"
-            )
-            trader_key = str(trader).lower()
-            trader_stats[trader_key] = trader_stats.get(trader_key, 0) + 1
-            profile = trader_profiles.get(trader_key, {})
-            profile["signals"] = profile.get("signals", 0) + 1
-            profile["last_seen"] = time.time()
-            update_trader_profile_metrics(profile)
-            trader_profiles[trader_key] = profile
-            reputation = get_reputation_label(trader_stats[trader_key], profile)
-            critical = trader_stats[trader_key] > 5
-            condition_id = trade.get("conditionId") or trade.get("condition_id")
-            market_title = None
-            market_details = None
-            if condition_id:
-                market_details = client.get_market_details(str(condition_id))
-                if market_details:
-                    market_title = (
-                        market_details.get("question")
-                        or market_details.get("title")
-                        or market_details.get("name")
-                    )
-            if trade.get("estimated_usd_value") is not None:
-                logger.info(
-                    "[ANALYSIS] Found trade of $%s on market: %s",
-                    trade.get("estimated_usd_value"),
-                    market_title or "Unknown",
-                )
-            current_market_price = (
-                get_current_market_price(market_details) if market_details else None
-            )
-            if condition_id and current_market_price is not None:
-                update_market_price_history(state, str(condition_id), current_market_price)
-            history_entry = trader_history.get(trader_key, {})
-            repeat_offender = is_watchlisted and history_entry.get("count", 0) > 0
-            risk_label, risk_reasons = assess_market_risk(
-                market_details,
-                min_volume=MIN_MARKET_VOLUME,
-                max_spread_pct=MAX_SPREAD_PCT,
-            )
-            market_trend = (
-                get_market_trend(state, str(condition_id))
-                if condition_id
-                else "Flat"
-            )
-            market_regime = classify_market_regime(risk_label, market_trend)
-            market_url = build_market_url(trade, market_details)
-            if market_url:
-                trade["marketUrl"] = market_url
-            entry_price = trade.get("price")
-            if entry_price is not None:
-                try:
-                    entry_price = float(entry_price)
-                except (TypeError, ValueError):
-                    entry_price = None
-            update_recent_smart_trades(state, trade)
-            update_recent_market_signals(state, str(condition_id) if condition_id else None)
-            if is_watchlisted and condition_id:
-                update_recent_smart_wallet_entries(
-                    state,
-                    str(condition_id),
-                    trader_key,
-                )
-            signal_type, signal_density, priority_multiplier = get_signal_context(
-                state,
-                str(condition_id) if condition_id else None,
-            )
-            market_id = str(condition_id) if condition_id else "unknown"
-            analyzer.record_whale_trade(market_id)
-            sentiment_label = get_sentiment(state)
-            score, reasons = compute_signal_score(
-                trade,
-                market_details,
-                trader_stats[trader_key],
-                impact,
-                trader_profile=profile,
-                market_trend=market_trend,
-                market_sentiment=sentiment_label,
-                repeat_offender=repeat_offender,
-                repeat_offender_bonus=REPEAT_OFFENDER_BONUS,
-                market_tracker=analyzer.market_tracker,
-                market_id=market_id,
-                reason_weights=state.get("reason_weights"),
-            )
-            update_discovery_watchlist(
-                state,
-                trader_key,
-                score,
-                discovered_watchlist,
-            )
-            if score > 80:
-                log_high_score_alert(
-                    trade,
-                    score,
-                    reasons,
-                    market_title=market_title,
-                    market_url=market_url,
-                )
-                if entry_price is not None and condition_id:
-                    add_virtual_trade(
-                        virtual_trades,
-                        trade,
-                        str(condition_id),
-                        entry_price,
-                        reasons,
-                        extract_trade_side(trade),
-                    )
-            history_manager.add_trade(market_id, trade_id, score)
-            momentum_alert = history_manager.detect_momentum(
-                market_id,
-                min_score=MOMENTUM_MIN_SCORE,
-                window_seconds=SMART_WALLET_WINDOW_S,
-                min_trades=MOMENTUM_MIN_TRADES,
-            )
-            if risk_label == "High" and score <= 90:
-                logger.info(
-                    "🚫 Guarded alert skipped | Risk: %s | Score: %s | Reasons: %s",
-                    risk_label,
-                    score,
-                    ", ".join(risk_reasons) or "N/A",
-                )
-                trader_history[trader_key] = {
-                    "count": history_entry.get("count", 0) + 1,
-                    "last_seen": time.time(),
-                    "watchlist": is_watchlisted,
-                }
-                continue
-            log_signal_event(
-                signal_type,
-                priority_multiplier,
-                market_title,
-                trader_key,
-                trader_stats[trader_key],
-                score,
-                risk_label,
-                reasons,
-                momentum_alert=momentum_alert,
-            )
-            message = format_trade_message(
-                trade,
-                market_title=market_title,
-                impact=impact,
-                reputation=reputation,
-                critical=critical,
-                sentiment=sentiment_label,
-                signal_score=score,
-                reasons=reasons,
-                risk_label=risk_label,
-                risk_reasons=risk_reasons,
-                signal_type=signal_type,
-                signal_density=signal_density,
-                priority_multiplier=priority_multiplier,
-                market_trend=market_trend,
-                market_regime=market_regime,
-            )
-            if momentum_alert:
-                message = f"🚀 MOMENTUM ALERT\n\n{message}"
-            notifier.send_message(message)
-            stats["alerts_sent"] = int(stats.get("alerts_sent", 0)) + 1
-            stats["last_score"] = score
-            stats["last_market"] = market_title or "Unknown"
-            stats["last_url"] = market_url or "N/A"
-            record_signal_history(
-                signal_history,
-                trade,
-                score,
-                reasons,
-                market_title,
-                market_url,
-                risk_label,
-                signal_type,
-                momentum_alert,
-            )
-            trader_history[trader_key] = {
-                "count": history_entry.get("count", 0) + 1,
-                "last_seen": time.time(),
-                "watchlist": is_watchlisted,
-            }
-            add_tracked_position(
-                state,
-                trade_id,
-                str(condition_id) if condition_id else None,
-                entry_price,
-                str(trader),
-            )
-        else:
-            logger.info(
-                "Skipping whale trade %s | watchlisted=%s | high_impact=%s | trader=%s | value=%s",
-                trade_id,
-                is_watchlisted,
-                is_high_impact,
-                trade.get("trader") or "Unknown",
-                trade.get("estimated_usd_value"),
-            )
-
-    state["seen_trades"] = list(seen_trades)
-    state["trader_stats"] = trader_stats
-    state["trader_profiles"] = trader_profiles
-    refresh_elite_smart_wallets(state)
+    stats["trade_feed"] = whale_alerts or ["No whale orders this cycle."]
+    stats["whale_trades"] = len(whale_alerts)
+    state["processed_order_ids"] = list(processed_order_ids)[-5000:]
+    if bid_volumes:
+        top_market, top_amount = max(bid_volumes.items(), key=lambda item: item[1])
+        stats["top_opportunity_market"] = top_market
+        stats["top_opportunity_amount"] = top_amount
     return stats
 
 

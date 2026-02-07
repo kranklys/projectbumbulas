@@ -16,7 +16,6 @@ from src.config import (
     DEFAULT_TRADE_LIMIT,
     MARKETS_ENDPOINT,
     PUBLIC_API_URL,
-    RATE_LIMIT_BACKOFF_S,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,9 +27,6 @@ REQUEST_HEADERS = {
     ),
     "Accept": "application/json",
 }
-
-RETRY_WAIT_S = 15
-
 
 class PolyClient:
     """Minimal client for fetching public data from Polymarket CLOB."""
@@ -56,41 +52,24 @@ class PolyClient:
                 timeout=self.timeout_s,
                 headers=REQUEST_HEADERS,
             )
-            if response.status_code == 401:
-                logger.error("API Key Required: received 401 Unauthorized from %s", url)
-                if allow_fallback and self.public_base_url:
-                    fallback_url = url.replace(self.clob_base_url, self.public_base_url)
-                    if fallback_url != url:
-                        return self._get(fallback_url, params=params, allow_fallback=False)
-                logger.warning("Status %s from %s. Retrying in %ss.", response.status_code, url, RETRY_WAIT_S)
-                time.sleep(RETRY_WAIT_S)
+            if response.status_code in {404, 429}:
+                logger.warning(
+                    "Status %s from %s. Backing off for %ss.",
+                    response.status_code,
+                    url,
+                    5,
+                )
+                time.sleep(5)
                 return None
-            if response.status_code == 403:
-                logger.warning("Status %s from %s. Retrying in %ss.", response.status_code, url, RETRY_WAIT_S)
-                time.sleep(RETRY_WAIT_S)
+            if response.status_code >= 400:
+                logger.warning("Status %s from %s. Skipping.", response.status_code, url)
                 return None
-            if response.status_code == 404:
-                logger.warning("Status %s from %s. Retrying in %ss.", response.status_code, url, RETRY_WAIT_S)
-                time.sleep(RETRY_WAIT_S)
-                return None
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                sleep_for = RATE_LIMIT_BACKOFF_S
-                if retry_after:
-                    try:
-                        sleep_for = int(retry_after)
-                    except ValueError:
-                        logger.warning("Invalid Retry-After header: %s", retry_after)
-                logger.warning("Rate limited (429). Backing off for %ss", sleep_for)
-                time.sleep(sleep_for)
-                return None
-            response.raise_for_status()
             return response.json()
         except requests.RequestException as exc:
-            logger.exception("Request failed: %s", exc)
+            logger.warning("Request failed: %s", exc)
             return None
         except ValueError as exc:
-            logger.exception("Failed to parse JSON response: %s", exc)
+            logger.warning("Failed to parse JSON response: %s", exc)
             return None
 
     def fetch_active_events(self, limit: int = 15) -> list[dict[str, Any]]:
