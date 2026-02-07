@@ -29,7 +29,7 @@ class TradeAnalyzer:
         self.market_tracker: dict[str, list[float]] = {}
 
     def find_whale_trades(
-        self, trades: list[dict[str, Any]] | None = None, min_usd: float = 10000
+        self, trades: list[dict[str, Any]] | None = None, min_usd: float = 100
     ) -> list[dict[str, Any]]:
         """Return trades with total value above min_usd."""
         trades_to_check = trades if trades is not None else self.trades

@@ -1226,6 +1226,12 @@ def process_trades(
                         or market_details.get("title")
                         or market_details.get("name")
                     )
+            if trade.get("estimated_usd_value") is not None:
+                logger.info(
+                    "[ANALYSIS] Found trade of $%s on market: %s",
+                    trade.get("estimated_usd_value"),
+                    market_title or "Unknown",
+                )
             current_market_price = (
                 get_current_market_price(market_details) if market_details else None
             )
