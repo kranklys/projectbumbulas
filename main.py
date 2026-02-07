@@ -45,6 +45,8 @@ SMART_WALLET_THRESHOLD = 3
 MOMENTUM_MIN_SCORE = 85
 MOMENTUM_MIN_TRADES = 3
 CLEANUP_RETENTION_S = 24 * 60 * 60
+FETCH_RETRY_ATTEMPTS = 3
+FETCH_RETRY_BACKOFF_S = 2
 
 COLOR_MOMENTUM = "\033[95m"
 COLOR_WHALE = "\033[94m"
@@ -67,6 +69,12 @@ def format_trade_message(
     priority_multiplier: int = 1,
 ) -> str:
     value = trade.get("estimated_usd_value")
+    wallet_pnl = (
+        trade.get("pnl")
+        or trade.get("profitLoss")
+        or trade.get("estimatedPnl")
+        or trade.get("estimated_profit")
+    )
     trader = (
         trade.get("trader")
         or trade.get("taker")
@@ -92,6 +100,7 @@ def format_trade_message(
         f"{header}\n\n"
         f"🎯 Market: {title}\n\n"
         f"💰 Amount: ${value if value is not None else 'N/A'}\n\n"
+        f"🧾 Wallet P/L: {wallet_pnl if wallet_pnl is not None else 'N/A'}\n\n"
         f"📈 Price: {price}\n\n"
         f"🧠 Reputation: {reputation_label}\n\n"
         f"🌡️ Sentiment: {sentiment_label}\n\n"
@@ -663,6 +672,7 @@ def process_trades(
         is_watchlisted = analyzer.is_watchlist_trade(trade)
         is_high_impact = analyzer.is_high_impact(trade)
         impact = estimate_price_impact(trade)
+        trade["is_watchlisted"] = is_watchlisted
 
         if is_watchlisted or is_high_impact:
             trader = (
@@ -866,7 +876,21 @@ def main() -> None:
     dashboard.start()
     try:
         while True:
-            trades = client.fetch_latest_trades()
+            trades = None
+            for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
+                try:
+                    trades = client.fetch_latest_trades()
+                    if trades is None:
+                        raise ValueError("No trade data returned")
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Trade fetch attempt %s/%s failed: %s",
+                        attempt,
+                        FETCH_RETRY_ATTEMPTS,
+                        exc,
+                    )
+                    time.sleep(FETCH_RETRY_BACKOFF_S * attempt)
             if not trades:
                 logger.warning("No trades returned from API.")
                 stats = {"cycle": cycle, "fetched_trades": 0}

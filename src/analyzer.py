@@ -142,6 +142,10 @@ def compute_signal_score(
         score += 10
         reasons.append("Frequent trader activity")
 
+    if trade.get("is_watchlisted"):
+        score += 50
+        reasons.append("Watchlist whale priority")
+
     if trader_profile:
         resolved_count = trader_profile.get("resolved_count", 0)
         winrate = trader_profile.get("winrate")
