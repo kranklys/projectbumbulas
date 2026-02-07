@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import statistics
 import time
 from collections import deque
 
@@ -187,12 +188,42 @@ def normalize_trade(trade: dict, fallback_index: int) -> dict:
     return normalized
 
 
-def get_reputation_label(count: int) -> str:
+def get_reputation_label(count: int, profile: dict | None = None) -> str:
+    if profile and profile.get("elite"):
+        return "Elite Smart Wallet"
     if count >= 10:
         return "Elite Trader"
     if count >= 5:
         return "Frequent"
     return "New"
+
+
+def update_trader_profile_metrics(profile: dict) -> None:
+    resolved = profile.get("resolved_count", 0)
+    wins = profile.get("wins", 0)
+    losses = profile.get("losses", 0)
+    total_profit = profile.get("total_profit", 0.0)
+    if resolved > 0:
+        profile["avg_profit"] = total_profit / resolved
+    total_outcomes = wins + losses
+    if total_outcomes > 0:
+        profile["winrate"] = wins / total_outcomes
+    profit_history = profile.get("profit_history", [])
+    if len(profit_history) >= 2:
+        profile["profit_volatility"] = statistics.pstdev(profit_history)
+    profile["elite"] = (
+        resolved >= 5
+        and profile.get("winrate", 0) >= 0.6
+        and profile.get("avg_profit", 0) > 0
+    )
+
+
+def refresh_elite_smart_wallets(state: dict) -> None:
+    profiles = state.get("trader_profiles", {})
+    elites = [
+        trader for trader, profile in profiles.items() if profile.get("elite", False)
+    ]
+    state["elite_smart_wallets"] = elites
 
 
 def add_tracked_position(
@@ -490,15 +521,19 @@ def update_tracked_positions(
                 pnl = current_price - entry_price
                 total_profit = profile.get("total_profit", 0.0) + pnl
                 profile["total_profit"] = total_profit
-                profile["avg_profit"] = total_profit / profile["resolved_count"]
                 if pnl > 0:
                     profile["wins"] = profile.get("wins", 0) + 1
                 else:
                     profile["losses"] = profile.get("losses", 0) + 1
+                profit_history = profile.get("profit_history", [])
+                profit_history.append(pnl)
+                profile["profit_history"] = profit_history[-50:]
+                update_trader_profile_metrics(profile)
             trader_profiles[str(trader).lower()] = profile
 
     state["tracked_positions"] = updated_positions
     state["trader_profiles"] = trader_profiles
+    refresh_elite_smart_wallets(state)
 
 
 def process_trades(
@@ -549,8 +584,9 @@ def process_trades(
             profile = trader_profiles.get(trader_key, {})
             profile["signals"] = profile.get("signals", 0) + 1
             profile["last_seen"] = time.time()
+            update_trader_profile_metrics(profile)
             trader_profiles[trader_key] = profile
-            reputation = get_reputation_label(trader_stats[trader_key])
+            reputation = get_reputation_label(trader_stats[trader_key], profile)
             critical = trader_stats[trader_key] > 5
             condition_id = trade.get("conditionId") or trade.get("condition_id")
             market_title = None
@@ -595,6 +631,7 @@ def process_trades(
                 market_details,
                 trader_stats[trader_key],
                 impact,
+                trader_profile=profile,
                 repeat_offender=repeat_offender,
                 repeat_offender_bonus=REPEAT_OFFENDER_BONUS,
                 market_tracker=analyzer.market_tracker,
@@ -678,6 +715,7 @@ def process_trades(
     state["seen_trade_ids"] = list(seen_trade_ids)
     state["trader_stats"] = trader_stats
     state["trader_profiles"] = trader_profiles
+    refresh_elite_smart_wallets(state)
 
 
 def log_top_traders(state: dict, limit: int = 5) -> None:
@@ -694,9 +732,13 @@ def log_top_traders(state: dict, limit: int = 5) -> None:
         wins = data.get("wins", 0)
         losses = data.get("losses", 0)
         avg_profit = data.get("avg_profit", 0.0)
+        winrate = data.get("winrate")
         signals = data.get("signals", 0)
+        elite_flag = "⭐" if data.get("elite") else ""
+        winrate_label = f" winrate:{winrate:.2%}" if isinstance(winrate, float) else ""
         summary.append(
-            f"{trader[:6]}… wins:{wins} losses:{losses} avg:{avg_profit:.4f} signals:{signals}"
+            f"{trader[:6]}…{elite_flag} wins:{wins} losses:{losses} avg:{avg_profit:.4f}"
+            f"{winrate_label} signals:{signals}"
         )
     logger.info("Top traders: %s", " | ".join(summary))
 

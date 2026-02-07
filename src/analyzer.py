@@ -98,6 +98,7 @@ def compute_signal_score(
     market_details: dict[str, Any] | None,
     reputation_count: int,
     impact: float | None,
+    trader_profile: dict[str, Any] | None = None,
     repeat_offender: bool = False,
     repeat_offender_bonus: int = 10,
     market_tracker: dict[str, list[float]] | None = None,
@@ -139,6 +140,29 @@ def compute_signal_score(
     elif reputation_count >= 5:
         score += 10
         reasons.append("Frequent trader activity")
+
+    if trader_profile:
+        resolved_count = trader_profile.get("resolved_count", 0)
+        winrate = trader_profile.get("winrate")
+        avg_profit = trader_profile.get("avg_profit")
+        profit_volatility = trader_profile.get("profit_volatility")
+        elite = trader_profile.get("elite", False)
+        if elite:
+            score += 15
+            reasons.append("Elite smart wallet profile")
+        if resolved_count >= 5 and isinstance(winrate, (int, float)):
+            if winrate >= 0.65:
+                score += 10
+                reasons.append("Strong win rate history")
+            elif winrate >= 0.55:
+                score += 5
+                reasons.append("Positive win rate history")
+        if isinstance(avg_profit, (int, float)) and avg_profit > 0:
+            score += 5
+            reasons.append("Positive average outcome")
+        if isinstance(profit_volatility, (int, float)) and profit_volatility < 0.05:
+            score += 3
+            reasons.append("Consistent outcomes")
 
     if repeat_offender:
         score += repeat_offender_bonus
