@@ -6,11 +6,21 @@ import logging
 import time
 from collections import deque
 
-from src.analyzer import TradeAnalyzer, compute_signal_score, track_market_volumes
+from src.analyzer import (
+    TradeAnalyzer,
+    assess_market_risk,
+    compute_signal_score,
+    track_market_volumes,
+)
 from src.notifications import TelegramNotifier
 from src.polymarket_api import PolyClient
 from src.storage import BotStateStorage
-from src.config import POLL_INTERVAL_S, SAVE_INTERVAL_CYCLES
+from src.config import (
+    MAX_SPREAD_PCT,
+    MIN_MARKET_VOLUME,
+    POLL_INTERVAL_S,
+    SAVE_INTERVAL_CYCLES,
+)
 
 
 logging.basicConfig(
@@ -29,6 +39,8 @@ def format_trade_message(
     sentiment: str | None = None,
     signal_score: int | None = None,
     reasons: list[str] | None = None,
+    risk_label: str | None = None,
+    risk_reasons: list[str] | None = None,
 ) -> str:
     value = trade.get("estimated_usd_value")
     trader = (
@@ -46,6 +58,8 @@ def format_trade_message(
     sentiment_label = sentiment or "Neutral"
     score_label = f"{signal_score}/100" if signal_score is not None else "N/A"
     reason_text = ", ".join(reasons or []) or "N/A"
+    risk_text = risk_label or "Unknown"
+    risk_reason_text = ", ".join(risk_reasons or []) or "N/A"
 
     return (
         f"{header}\n\n"
@@ -56,6 +70,8 @@ def format_trade_message(
         f"🌡️ Sentiment: {sentiment_label}\n\n"
         f"✅ Signal Score: {score_label}\n"
         f"🧩 Reasons: {reason_text}\n\n"
+        f"⚠️ Risk: {risk_text}\n"
+        f"🧾 Risk Factors: {risk_reason_text}\n\n"
         f"👤 Trader: {trader}\n\n"
         f"🔗 Link: {link}"
     )
@@ -311,6 +327,20 @@ def process_trades(
                         or market_details.get("title")
                         or market_details.get("name")
                     )
+            risk_label, risk_reasons = assess_market_risk(
+                market_details,
+                min_volume=MIN_MARKET_VOLUME,
+                max_spread_pct=MAX_SPREAD_PCT,
+            )
+            if risk_label == "High":
+                logger.info(
+                    "Skipping alert due to high market risk: %s (%s)",
+                    risk_label,
+                    ", ".join(risk_reasons),
+                )
+                processed_trade_ids.append(trade_id)
+                processed_trade_id_set.add(trade_id)
+                continue
             entry_price = trade.get("price")
             if entry_price is not None:
                 try:
@@ -339,6 +369,8 @@ def process_trades(
                 sentiment=get_sentiment(state),
                 signal_score=score,
                 reasons=reasons,
+                risk_label=risk_label,
+                risk_reasons=risk_reasons,
             )
             notifier.send_message(message)
             add_tracked_position(

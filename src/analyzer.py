@@ -141,6 +141,37 @@ def compute_signal_score(
     return score, reasons
 
 
+def assess_market_risk(
+    market_details: dict[str, Any] | None,
+    min_volume: float,
+    max_spread_pct: float,
+) -> tuple[str, list[str]]:
+    """Classify market risk based on volume and spread."""
+    if not market_details:
+        return "Unknown", ["Market details unavailable"]
+
+    reasons: list[str] = []
+    volume = _extract_volume_24h(market_details)
+    if volume is not None:
+        if volume < min_volume:
+            reasons.append("Low volume")
+        elif volume >= min_volume * 5:
+            reasons.append("Healthy volume")
+
+    spread_pct = _estimate_spread_pct(market_details)
+    if spread_pct is not None:
+        if spread_pct > max_spread_pct:
+            reasons.append("Wide spread")
+        elif spread_pct <= max_spread_pct / 2:
+            reasons.append("Tight spread")
+
+    if "Low volume" in reasons or "Wide spread" in reasons:
+        return "High", reasons
+    if "Healthy volume" in reasons or "Tight spread" in reasons:
+        return "Low", reasons
+    return "Medium", reasons
+
+
 def track_market_volumes(
     markets: list[dict[str, Any]],
     previous_volumes: dict[str, float],
@@ -189,3 +220,18 @@ def _extract_volume_24h(market: dict[str, Any]) -> float | None:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _estimate_spread_pct(market: dict[str, Any]) -> float | None:
+    best_bid = market.get("bestBid")
+    best_ask = market.get("bestAsk")
+    if best_bid is None or best_ask is None:
+        return None
+    try:
+        best_bid = float(best_bid)
+        best_ask = float(best_ask)
+    except (TypeError, ValueError):
+        return None
+    if best_ask <= 0:
+        return None
+    return ((best_ask - best_bid) / best_ask) * 100
