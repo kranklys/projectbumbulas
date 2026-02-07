@@ -14,6 +14,7 @@ WATCHLIST_ADDRESSES = {
     "0x2222222222222222222222222222222222222222",
     "0x3333333333333333333333333333333333333333",
 }
+WHALE_TRADE_THRESHOLD = 100
 
 
 class TradeAnalyzer:
@@ -28,8 +29,37 @@ class TradeAnalyzer:
         self.watchlist = {addr.lower() for addr in (watchlist or WATCHLIST_ADDRESSES)}
         self.market_tracker: dict[str, list[float]] = {}
 
+    @staticmethod
+    def _extract_trade_id(trade: dict[str, Any], fallback_index: int) -> str:
+        return str(
+            trade.get("id")
+            or trade.get("tradeId")
+            or trade.get("trade_id")
+            or trade.get("hash")
+            or trade.get("transactionHash")
+            or f"fallback-{fallback_index}"
+        )
+
+    def filter_new_trades(
+        self, seen_trade_ids: set[str]
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Filter trades to only those not seen before, updating seen_trade_ids."""
+        new_trades: list[dict[str, Any]] = []
+        new_trade_ids: list[str] = []
+        for index, trade in enumerate(self.trades):
+            trade_id = self._extract_trade_id(trade, index)
+            trade.setdefault("id", trade_id)
+            if trade_id in seen_trade_ids:
+                continue
+            seen_trade_ids.add(trade_id)
+            new_trade_ids.append(trade_id)
+            new_trades.append(trade)
+        return new_trades, new_trade_ids
+
     def find_whale_trades(
-        self, trades: list[dict[str, Any]] | None = None, min_usd: float = 100
+        self,
+        trades: list[dict[str, Any]] | None = None,
+        min_usd: float = WHALE_TRADE_THRESHOLD,
     ) -> list[dict[str, Any]]:
         """Return trades with total value above min_usd."""
         trades_to_check = trades if trades is not None else self.trades
@@ -40,6 +70,10 @@ class TradeAnalyzer:
                 trade["estimated_usd_value"] = round(total_value, 2)
                 whale_trades.append(trade)
         return whale_trades
+
+    def estimate_trade_value_usd(self, trade: dict[str, Any]) -> float:
+        """Expose trade value estimation for callers needing consistent sizing."""
+        return self._estimate_trade_value_usd(trade)
 
     def is_watchlist_trade(self, trade: dict[str, Any]) -> bool:
         """Check if the trade was placed by a watchlisted address."""
