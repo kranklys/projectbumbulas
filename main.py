@@ -30,7 +30,13 @@ from src.config import (
     POLL_INTERVAL_S,
     SAVE_INTERVAL_CYCLES,
 )
-from src.backtest import BacktestConfig, run_backtest
+from src.backtest import (
+    BacktestConfig,
+    evaluate_thresholds,
+    fetch_trades_for_backtest,
+    run_backtest,
+    run_backtest_from_trades,
+)
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
@@ -1259,6 +1265,14 @@ def parse_args() -> argparse.Namespace:
         help="Minimum signal score to include in the backtest.",
     )
     parser.add_argument(
+        "--market-id",
+        help="Market/condition ID to fetch historical trades for backtesting.",
+    )
+    parser.add_argument(
+        "--sweep-thresholds",
+        help="Comma-separated score thresholds to evaluate for a sweet spot.",
+    )
+    parser.add_argument(
         "--horizon-minutes",
         type=int,
         default=60,
@@ -1351,12 +1365,38 @@ def main() -> None:
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.backtest_path:
+    if args.backtest_path or args.market_id:
         config = BacktestConfig(
             score_threshold=args.score_threshold,
             horizon_minutes=args.horizon_minutes,
             max_trades=args.max_trades,
         )
-        run_backtest(args.backtest_path, config)
+        report = None
+        trades: list[dict] | None = None
+        if args.backtest_path and os.path.exists(args.backtest_path):
+            report = run_backtest(args.backtest_path, config)
+        elif args.market_id:
+            trades = fetch_trades_for_backtest(args.market_id, args.max_trades)
+            report = run_backtest_from_trades(trades, config)
+        else:
+            raise FileNotFoundError(
+                "Backtest file not found and no market_id provided."
+            )
+
+        if args.sweep_thresholds and trades is not None:
+            thresholds = [
+                int(value.strip())
+                for value in args.sweep_thresholds.split(",")
+                if value.strip().isdigit()
+            ]
+            if thresholds:
+                sweep = evaluate_thresholds(trades, thresholds, args.horizon_minutes)
+                best = sweep.get("best", {})
+                logger.info(
+                    "Sweet spot threshold: %s (profit: %.2f, hit rate: %.2f%%)",
+                    best.get("score_threshold"),
+                    best.get("total_potential_profit", 0.0),
+                    best.get("hit_rate", 0.0) * 100,
+                )
     else:
         main()

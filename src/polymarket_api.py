@@ -104,3 +104,42 @@ class PolyClient:
 
         logger.warning("Unexpected markets response format: %s", type(payload))
         return []
+
+    def fetch_historical_data(
+        self,
+        market_id: str,
+        limit: int = 500,
+        max_pages: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Fetch historical trades for a given market/condition ID."""
+        url = f"{self.base_url}{TRADES_ENDPOINT}"
+        params: dict[str, Any] = {"limit": limit}
+        params["marketId"] = market_id
+        params["conditionId"] = market_id
+
+        trades: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            if cursor:
+                params["cursor"] = cursor
+            payload = self._get(url, params=params)
+            if payload is None:
+                break
+            if isinstance(payload, dict):
+                batch = payload.get("trades", [])
+                cursor = payload.get("next_cursor") or payload.get("nextCursor")
+            elif isinstance(payload, list):
+                batch = payload
+                cursor = None
+            else:
+                logger.warning("Unexpected historical trades response format: %s", type(payload))
+                break
+
+            if not isinstance(batch, list) or not batch:
+                break
+            trades.extend([trade for trade in batch if isinstance(trade, dict)])
+            if not cursor:
+                break
+
+        logger.info("Fetched %s historical trades for market %s", len(trades), market_id)
+        return trades

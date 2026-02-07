@@ -13,6 +13,7 @@ from statistics import mean
 from typing import Any
 
 from src.analyzer import WATCHLIST_ADDRESSES, compute_signal_score
+from src.polymarket_api import PolyClient
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,12 @@ def calculate_drawdown(returns: list[float]) -> float:
 
 def run_backtest(trades_path: str, config: BacktestConfig) -> dict[str, Any]:
     raw_trades = load_trades(trades_path, config.max_trades)
+    return run_backtest_from_trades(raw_trades, config)
+
+
+def run_backtest_from_trades(
+    raw_trades: list[dict[str, Any]], config: BacktestConfig
+) -> dict[str, Any]:
     normalized: list[dict[str, Any]] = []
     for index, trade in enumerate(raw_trades):
         normalized.append(normalize_trade(trade, index))
@@ -189,6 +196,9 @@ def run_backtest(trades_path: str, config: BacktestConfig) -> dict[str, Any]:
     executed_signals = 0
     wins = 0
     returns: list[float] = []
+    winner_scores: list[int] = []
+    loser_scores: list[int] = []
+    total_profit = 0.0
 
     horizon_seconds = config.horizon_minutes * 60
     watchlist = {addr.lower() for addr in WATCHLIST_ADDRESSES}
@@ -234,8 +244,14 @@ def run_backtest(trades_path: str, config: BacktestConfig) -> dict[str, Any]:
         executed_signals += 1
         roi = compute_roi(current_price, exit_price, trade.get("side"))
         returns.append(roi)
+        trade_value = estimate_trade_value(trade) or 0.0
+        profit = roi * trade_value
+        total_profit += profit
         if roi > 0:
             wins += 1
+            winner_scores.append(score)
+        else:
+            loser_scores.append(score)
 
     hit_rate = (wins / executed_signals) if executed_signals else 0.0
     avg_roi = mean(returns) if returns else 0.0
@@ -253,6 +269,9 @@ def run_backtest(trades_path: str, config: BacktestConfig) -> dict[str, Any]:
         "avg_roi": avg_roi,
         "max_drawdown": max_drawdown,
         "total_return": total_return,
+        "total_potential_profit": total_profit,
+        "winner_avg_score": mean(winner_scores) if winner_scores else 0.0,
+        "loser_avg_score": mean(loser_scores) if loser_scores else 0.0,
         "score_threshold": config.score_threshold,
         "horizon_minutes": config.horizon_minutes,
     }
@@ -274,3 +293,31 @@ def run_backtest(trades_path: str, config: BacktestConfig) -> dict[str, Any]:
     )
     return report
 
+
+def fetch_trades_for_backtest(
+    market_id: str,
+    max_trades: int | None = None,
+) -> list[dict[str, Any]]:
+    if not market_id:
+        raise ValueError("market_id is required to fetch historical trades.")
+    client = PolyClient()
+    trades = client.fetch_historical_data(market_id)
+    if max_trades is not None:
+        trades = trades[:max_trades]
+    return trades
+
+
+def evaluate_thresholds(
+    raw_trades: list[dict[str, Any]],
+    thresholds: list[int],
+    horizon_minutes: int,
+) -> dict[str, Any]:
+    results = []
+    for threshold in thresholds:
+        config = BacktestConfig(
+            score_threshold=threshold, horizon_minutes=horizon_minutes
+        )
+        report = run_backtest_from_trades(raw_trades, config)
+        results.append(report)
+    best = max(results, key=lambda item: item.get("total_potential_profit", 0.0), default={})
+    return {"results": results, "best": best}
