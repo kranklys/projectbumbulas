@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -13,17 +14,52 @@ WATCHLIST_ADDRESSES = {
     "0x2222222222222222222222222222222222222222",
     "0x3333333333333333333333333333333333333333",
 }
+WHALE_TRADE_THRESHOLD = 500
 
 
 class TradeAnalyzer:
     """Analyze trades for whale activity and watchlisted wallets."""
 
-    def __init__(self, trades: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        trades: list[dict[str, Any]],
+        watchlist: set[str] | None = None,
+    ) -> None:
         self.trades = trades
+        self.watchlist = {addr.lower() for addr in (watchlist or WATCHLIST_ADDRESSES)}
         self.market_tracker: dict[str, list[float]] = {}
 
+    @staticmethod
+    def _extract_trade_id(trade: dict[str, Any], fallback_index: int) -> str:
+        return str(
+            trade.get("id")
+            or trade.get("tradeId")
+            or trade.get("trade_id")
+            or trade.get("hash")
+            or trade.get("transactionHash")
+            or f"fallback-{fallback_index}"
+        )
+
+    def filter_new_trades(
+        self, seen_trade_ids: set[str]
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Filter trades to only those not seen before, updating seen_trade_ids."""
+        new_trades: list[dict[str, Any]] = []
+        new_trade_ids: list[str] = []
+        for index, trade in enumerate(self.trades):
+            trade_id = self._extract_trade_id(trade, index)
+            trade.setdefault("id", trade_id)
+            if trade_id in seen_trade_ids:
+                continue
+            seen_trade_ids.add(trade_id)
+            new_trade_ids.append(trade_id)
+            new_trades.append(trade)
+        return new_trades, new_trade_ids
+
     def find_whale_trades(
-        self, trades: list[dict[str, Any]] | None = None, min_usd: float = 10000
+        self,
+        trades: list[dict[str, Any]] | None = None,
+        min_usd: float = WHALE_TRADE_THRESHOLD,
     ) -> list[dict[str, Any]]:
         """Return trades with total value above min_usd."""
         trades_to_check = trades if trades is not None else self.trades
@@ -35,6 +71,10 @@ class TradeAnalyzer:
                 whale_trades.append(trade)
         return whale_trades
 
+    def estimate_trade_value_usd(self, trade: dict[str, Any]) -> float:
+        """Expose trade value estimation for callers needing consistent sizing."""
+        return self._estimate_trade_value_usd(trade)
+
     def is_watchlist_trade(self, trade: dict[str, Any]) -> bool:
         """Check if the trade was placed by a watchlisted address."""
         address = (
@@ -45,7 +85,7 @@ class TradeAnalyzer:
         )
         if not address:
             return False
-        return str(address).lower() in {addr.lower() for addr in WATCHLIST_ADDRESSES}
+        return str(address).lower() in self.watchlist
 
     def is_high_impact(self, trade: dict[str, Any], threshold: float = 0.02) -> bool:
         """Detect if a single trade moved price by more than threshold."""
@@ -98,10 +138,14 @@ def compute_signal_score(
     market_details: dict[str, Any] | None,
     reputation_count: int,
     impact: float | None,
+    trader_profile: dict[str, Any] | None = None,
+    market_trend: str | None = None,
+    market_sentiment: str | None = None,
     repeat_offender: bool = False,
     repeat_offender_bonus: int = 10,
     market_tracker: dict[str, list[float]] | None = None,
     market_id: str | None = None,
+    reason_weights: dict[str, float] | None = None,
 ) -> tuple[int, list[str]]:
     """Compute a 0-100 signal score with reasons."""
     reasons: list[str] = []
@@ -114,58 +158,133 @@ def compute_signal_score(
         except (TypeError, ValueError):
             value = None
 
+    def weight_for(key: str) -> float:
+        if reason_weights is None:
+            return 1.0
+        return max(0.5, min(1.5, float(reason_weights.get(key, 1.0))))
+
     if value is not None:
         if value >= 50000:
-            score += 25
+            score += int(25 * weight_for("trade_size_very_large"))
             reasons.append("Very large trade size")
         elif value >= 10000:
-            score += 15
+            score += int(15 * weight_for("trade_size_large"))
             reasons.append("Large trade size")
         elif value >= 5000:
-            score += 10
+            score += int(10 * weight_for("trade_size_notable"))
             reasons.append("Notable trade size")
 
     if impact is not None:
         if impact >= 0.05:
-            score += 20
+            score += int(20 * weight_for("impact_high"))
             reasons.append("High price impact")
         elif impact >= 0.02:
-            score += 10
+            score += int(10 * weight_for("impact_moderate"))
             reasons.append("Moderate price impact")
 
     if reputation_count >= 10:
-        score += 20
+        score += int(20 * weight_for("reputation_elite"))
         reasons.append("Elite trader frequency")
     elif reputation_count >= 5:
-        score += 10
+        score += int(10 * weight_for("reputation_frequent"))
         reasons.append("Frequent trader activity")
 
+    if trade.get("is_watchlisted"):
+        score += int(50 * weight_for("watchlist_priority"))
+        reasons.append("Watchlist whale priority")
+
+    if trader_profile:
+        resolved_count = trader_profile.get("resolved_count", 0)
+        winrate = trader_profile.get("winrate")
+        avg_profit = trader_profile.get("avg_profit")
+        profit_volatility = trader_profile.get("profit_volatility")
+        elite = trader_profile.get("elite", False)
+        if elite:
+            score += int(15 * weight_for("profile_elite"))
+            reasons.append("Elite smart wallet profile")
+        if resolved_count >= 5 and isinstance(winrate, (int, float)):
+            if winrate >= 0.65:
+                score += int(10 * weight_for("profile_winrate_strong"))
+                reasons.append("Strong win rate history")
+            elif winrate >= 0.55:
+                score += int(5 * weight_for("profile_winrate_positive"))
+                reasons.append("Positive win rate history")
+        if isinstance(avg_profit, (int, float)) and avg_profit > 0:
+            score += int(5 * weight_for("profile_avg_profit"))
+            reasons.append("Positive average outcome")
+        if isinstance(profit_volatility, (int, float)) and profit_volatility < 0.05:
+            score += int(3 * weight_for("profile_consistent"))
+            reasons.append("Consistent outcomes")
+
+    if market_trend == "Up":
+        score += int(5 * weight_for("trend_up"))
+        reasons.append("Short-term market trend up")
+    elif market_trend == "Down":
+        score -= int(5 * weight_for("trend_down"))
+        reasons.append("Short-term market trend down")
+
+    if market_sentiment == "Bullish":
+        score += int(3 * weight_for("sentiment_bullish"))
+        reasons.append("Bullish smart wallet sentiment")
+    elif market_sentiment == "Bearish":
+        score -= int(3 * weight_for("sentiment_bearish"))
+        reasons.append("Bearish smart wallet sentiment")
+
     if repeat_offender:
-        score += repeat_offender_bonus
+        score += int(repeat_offender_bonus * weight_for("repeat_offender"))
         reasons.append("Repeat offender watchlist activity")
 
     if market_tracker is not None and market_id:
         window_start = time.time() - 60 * 60
         recent = [t for t in market_tracker.get(market_id, []) if t >= window_start]
         if len(recent) >= 2:
-            score += 30
+            score += int(30 * weight_for("market_momentum"))
             reasons.append("Crowd momentum in market")
 
     if market_details:
         volume = _extract_volume_24h(market_details)
         if volume is not None:
             if volume >= 100000:
-                score += 15
+                score += int(15 * weight_for("liquidity_high"))
                 reasons.append("High market liquidity")
             elif volume >= 20000:
-                score += 10
+                score += int(10 * weight_for("liquidity_medium"))
                 reasons.append("Moderate market liquidity")
             elif volume < 5000:
-                score -= 5
+                score -= int(5 * weight_for("liquidity_low"))
                 reasons.append("Low market liquidity")
 
     score = max(0, min(100, score))
     return score, reasons
+
+
+def log_high_score_alert(
+    trade: dict[str, Any],
+    score: int,
+    reasons: list[str],
+    market_title: str | None = None,
+    market_url: str | None = None,
+    file_path: str = "alerts.log",
+) -> None:
+    """Append high-score alert details to a log file."""
+    payload = {
+        "timestamp": time.time(),
+        "trade_id": trade.get("id"),
+        "score": score,
+        "reasons": reasons,
+        "market_title": market_title or "Unknown",
+        "market_url": market_url or trade.get("marketUrl") or trade.get("url"),
+        "trader": trade.get("trader")
+        or trade.get("taker")
+        or trade.get("maker")
+        or trade.get("wallet"),
+        "estimated_usd_value": trade.get("estimated_usd_value"),
+    }
+    try:
+        with open(file_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except OSError:
+        logger.warning("Failed to write high-score alert to %s", file_path)
 
 
 def evaluate_signal_density(
