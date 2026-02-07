@@ -53,7 +53,10 @@ class PolyClient:
                 timeout=self.timeout_s,
                 headers=REQUEST_HEADERS,
             )
-            if response.status_code in {404, 429}:
+            if response.status_code == 404:
+                logger.warning("Status %s from %s. Skipping.", response.status_code, url)
+                return None
+            if response.status_code == 429:
                 logger.warning(
                     "Status %s from %s. Backing off for %ss.",
                     response.status_code,
@@ -192,44 +195,46 @@ class PolyClient:
         logger.warning("Unexpected market details format: %s", type(payload))
         return {}
 
-    def fetch_markets(self, limit: int = 100) -> list[dict[str, Any]]:
+    def fetch_markets(self) -> list[dict[str, Any]]:
         """Fetch market data using Gamma events + CLOB price."""
-        events = self.fetch_active_events(limit=limit)
-        if not events:
-            return []
-        markets: list[dict[str, Any]] = []
-        for event in events:
-            title = event.get("title") or "Unknown"
-            for market in event.get("markets") or []:
-                token_ids = market.get("clobTokenIds") or []
-                if isinstance(token_ids, str):
-                    try:
-                        token_ids = json.loads(token_ids)
-                    except json.JSONDecodeError:
-                        token_ids = []
-                if not token_ids:
-                    continue
-                token_id = str(token_ids[0])
-                try:
-                    price_payload = self.fetch_token_price(token_id)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Price fetch failed for token %s: %s", token_id, exc)
-                    continue
-                price = price_payload.get("price")
-                if price is None:
-                    continue
-                markets.append(
-                    {
-                        "title": title,
-                        "price": price,
-                        "id": token_id,
-                    }
-                )
-        return markets
+        gamma_url = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=15"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        valid_markets = []
 
-    def get_market_data(self, limit: int = 100) -> list[dict[str, Any]]:
+        resp = requests.get(gamma_url, headers=headers)
+        events = resp.json()
+        for event in events:
+            for market in event.get("markets", []):
+                raw_tokens = market.get("clobTokenIds", "[]")
+                if isinstance(raw_tokens, str):
+                    token_ids = json.loads(raw_tokens)
+                else:
+                    token_ids = raw_tokens
+                if token_ids:
+                    t_id = token_ids[0]
+                    price_url = (
+                        f"https://clob.polymarket.com/price?token_id={t_id}&side=buy"
+                    )
+                    p_resp = requests.get(price_url, headers=headers)
+
+                    if p_resp.status_code == 200:
+                        price_data = p_resp.json()
+                        valid_markets.append(
+                            {
+                                "title": event.get("title"),
+                                "price": float(price_data.get("price")),
+                                "id": t_id,
+                                "condition_id": market.get("conditionId")
+                                or market.get("condition_id"),
+                            }
+                        )
+        if valid_markets:
+            logger.info("✅ Bumbulas Bot Active")
+        return valid_markets
+
+    def get_market_data(self) -> list[dict[str, Any]]:
         """Return analyzer-ready market data from Gamma + CLOB."""
-        return self.fetch_markets(limit=limit)
+        return self.fetch_markets()
 
     def fetch_historical_data(
         self,
@@ -250,3 +255,6 @@ class PolyClient:
             return payload
         logger.warning("Unexpected market history response format: %s", type(payload))
         return []
+
+
+PolymarketAPI = PolyClient
