@@ -284,6 +284,7 @@ def update_tracked_positions(
 
     updated_positions = []
     now = time.time()
+    trader_profiles = state.get("trader_profiles", {})
 
     for position in tracked_positions:
         condition_id = position.get("condition_id")
@@ -327,8 +328,23 @@ def update_tracked_positions(
 
         if not is_resolved and not is_expired:
             updated_positions.append(position)
+        elif is_resolved:
+            profile = trader_profiles.get(str(trader).lower(), {})
+            profile["resolved_count"] = profile.get("resolved_count", 0) + 1
+            current_price = get_current_market_price(market_details)
+            if current_price is not None:
+                pnl = current_price - entry_price
+                total_profit = profile.get("total_profit", 0.0) + pnl
+                profile["total_profit"] = total_profit
+                profile["avg_profit"] = total_profit / profile["resolved_count"]
+                if pnl > 0:
+                    profile["wins"] = profile.get("wins", 0) + 1
+                else:
+                    profile["losses"] = profile.get("losses", 0) + 1
+            trader_profiles[str(trader).lower()] = profile
 
     state["tracked_positions"] = updated_positions
+    state["trader_profiles"] = trader_profiles
 
 
 def process_trades(
@@ -342,6 +358,7 @@ def process_trades(
     processed_trade_ids = deque(state.get("processed_trade_ids", []), maxlen=1000)
     processed_trade_id_set = set(processed_trade_ids)
     trader_stats = state.get("trader_stats", {})
+    trader_profiles = state.get("trader_profiles", {})
 
     for index, trade in enumerate(whale_trades):
         trade_id = get_trade_id(trade, index)
@@ -362,6 +379,10 @@ def process_trades(
             )
             trader_key = str(trader).lower()
             trader_stats[trader_key] = trader_stats.get(trader_key, 0) + 1
+            profile = trader_profiles.get(trader_key, {})
+            profile["signals"] = profile.get("signals", 0) + 1
+            profile["last_seen"] = time.time()
+            trader_profiles[trader_key] = profile
             reputation = get_reputation_label(trader_stats[trader_key])
             critical = trader_stats[trader_key] > 5
             condition_id = trade.get("conditionId") or trade.get("condition_id")
@@ -441,6 +462,28 @@ def process_trades(
 
     state["processed_trade_ids"] = list(processed_trade_ids)
     state["trader_stats"] = trader_stats
+    state["trader_profiles"] = trader_profiles
+
+
+def log_top_traders(state: dict, limit: int = 5) -> None:
+    profiles = state.get("trader_profiles", {})
+    if not profiles:
+        return
+    ranked = sorted(
+        profiles.items(),
+        key=lambda item: (item[1].get("wins", 0), item[1].get("signals", 0)),
+        reverse=True,
+    )
+    summary = []
+    for trader, data in ranked[:limit]:
+        wins = data.get("wins", 0)
+        losses = data.get("losses", 0)
+        avg_profit = data.get("avg_profit", 0.0)
+        signals = data.get("signals", 0)
+        summary.append(
+            f"{trader[:6]}… wins:{wins} losses:{losses} avg:{avg_profit:.4f} signals:{signals}"
+        )
+    logger.info("Top traders: %s", " | ".join(summary))
 
 
 def main() -> None:
@@ -459,6 +502,7 @@ def main() -> None:
             process_trades(trades, notifier, client, state)
             if cycle % 10 == 0:
                 update_tracked_positions(client, notifier, state)
+                log_top_traders(state)
             storage.cleanup(state)
             if cycle % SAVE_INTERVAL_CYCLES == 0:
                 storage.save(state)

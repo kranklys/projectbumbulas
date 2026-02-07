@@ -27,6 +27,7 @@ class BotStateStorage:
                 "recent_smart_trades": [],
                 "recent_market_signals": [],
                 "recent_volume_spikes": [],
+                "trader_profiles": {},
             }
 
         try:
@@ -42,6 +43,7 @@ class BotStateStorage:
                 "recent_smart_trades": [],
                 "recent_market_signals": [],
                 "recent_volume_spikes": [],
+                "trader_profiles": {},
             }
 
         data.setdefault("processed_trade_ids", [])
@@ -51,6 +53,7 @@ class BotStateStorage:
         data.setdefault("recent_smart_trades", [])
         data.setdefault("recent_market_signals", [])
         data.setdefault("recent_volume_spikes", [])
+        data.setdefault("trader_profiles", {})
         return data
 
     def cleanup(self, state: dict[str, Any], max_trades: int = 1000) -> None:
